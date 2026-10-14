@@ -1,0 +1,9 @@
+results/
+cache/
+figures/
+codegen/
+*.slxc
+*.slx.autosave
+
+
+matlab_simulink/
