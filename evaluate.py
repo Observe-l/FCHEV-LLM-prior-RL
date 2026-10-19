@@ -9,6 +9,7 @@ import torch
 
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
+from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
 from train import evaluate, seed_everything
 
@@ -32,11 +33,13 @@ def main(argv=None):
     seed_everything(args.seed)
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
     algo_cfg = cfg["training"]
-    name = Path(args.checkpoint).name.lower()
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     algorithm = ckpt.get("algorithm", "sac")
-    cls = SAC if algorithm == "sac" else TD3
-    agent = cls(env.observation_space.shape[0], env.action_space.shape[0], algo_cfg, args.seed)
+    if algorithm == "two_agent_sac":
+        agent = TwoAgentSAC(algo_cfg, args.seed)
+    else:
+        cls = SAC if algorithm == "sac" else TD3
+        agent = cls(env.observation_space.shape[0], env.action_space.shape[0], algo_cfg, args.seed)
     agent.load(args.checkpoint)
     try:
         rows = evaluate(

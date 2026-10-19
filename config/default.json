@@ -110,7 +110,7 @@
     "algorithm": "sac",
     "episodes": 200,
     "hidden_layers": [256, 128, 64],
-    "gamma": 0.95,
+    "gamma": 0.9999,
     "tau": 0.005,
     "replay_capacity": 100000,
     "batch_size": 64,

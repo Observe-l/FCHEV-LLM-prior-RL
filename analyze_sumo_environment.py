@@ -35,10 +35,11 @@ def analyze(seed: int, output_root: Path, project_root: Path) -> Path:
     sumo_cfg = cfg["sumo"]
     randomization = generate_episode_randomization(sumo_cfg, seed)
     sumo_cfg["gui"] = False
-    scenario_cfg = build_scenario(project_root, sumo_cfg, cfg["vehicle"])
-    sim = SumoInterface(project_root, scenario_cfg, sumo_cfg, cfg["vehicle"])
     output_dir = output_root / f"environment_preview_seed{seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    sumo_cfg["scenario_output_dir"] = str(output_dir / "scenario")
+    scenario_cfg = build_scenario(project_root, sumo_cfg, cfg["vehicle"])
+    sim = SumoInterface(project_root, scenario_cfg, sumo_cfg, cfg["vehicle"])
 
     lead_rows = []
     state_rows = []

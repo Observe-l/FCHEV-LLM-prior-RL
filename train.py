@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 import json
 from pathlib import Path
+import re
 import random
 import time
 
@@ -16,12 +17,15 @@ import torch
 
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
+from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
 from util.observation import normalize_observation
 
 
 TRACE_FIELDS = [
-    "time_s", "reward", "soc", "battery_soh", "fcs_soh", "edu_soh",
+    "time_s", "reward", "driving_agent_reward", "energy_agent_reward",
+    "energy_agent_observed_executed_acceleration_m_s2",
+    "soc", "battery_soh", "fcs_soh", "edu_soh",
     "core_temperature_c", "surface_temperature_c", "ego_speed_m_s",
     "ego_acceleration_m_s2", "lead_speed_m_s", "lead_acceleration_m_s2",
     "ego_x_m", "lead_x_m", "following_distance_m",
@@ -78,6 +82,8 @@ REWARD_COMPONENTS = (
     "terminal_penalty", "zero_speed_negative_accel_penalty",
 )
 REWARD_BETA_COMPONENTS = ("hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc")
+DRIVING_OBSERVATION_INDICES = (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+ENERGY_OBSERVATION_INDICES = (0, 1, 2, 3)
 
 
 def seed_everything(seed):
@@ -110,9 +116,52 @@ def map_action(action_unit, action_space):
     return physical
 
 
+def map_split_actions(driving_action_unit, energy_action_unit, action_space):
+    """Map each independent SAC scalar action to its physical action channel."""
+    low = action_space.low.astype(np.float32)
+    high = action_space.high.astype(np.float32)
+    acceleration_unit = float(np.asarray(driving_action_unit).reshape(-1)[0])
+    power_unit = float(np.asarray(energy_action_unit).reshape(-1)[0])
+    acceleration = (
+        acceleration_unit * abs(float(low[0]))
+        if acceleration_unit < 0.0
+        else acceleration_unit * float(high[0])
+    )
+    power = float(low[1]) + (power_unit + 1.0) * 0.5 * float(high[1] - low[1])
+    return np.asarray([acceleration, power], dtype=np.float32)
+
+
+def split_agent_observations(observation, vehicle_cfg):
+    """Build driving and energy observations from the shared environment state."""
+    state = normalize_observation(observation, vehicle_cfg)
+    driving_state = state[np.asarray(DRIVING_OBSERVATION_INDICES, dtype=np.int64)].copy()
+    # The energy agent observes the measured acceleration present at this
+    # decision point, not the driving policy's unexecuted request.
+    energy_state = np.asarray(
+        [state[4], state[0], state[1], state[2], state[3]], dtype=np.float32
+    )
+    return driving_state, energy_state
+
+
+def split_agent_rewards(info):
+    """Partition per-step reward contributions while preserving their sum."""
+    rewards = info.get("reward_components", {})
+
+    def contribution(name):
+        return float(rewards.get(f"reward_contribution_{name}", 0.0) or 0.0)
+
+    driving_reward = sum(contribution(name) for name in (
+        "following", "comfort", "zero_speed_negative_accel_penalty", "terminal_penalty"
+    ))
+    energy_reward = sum(contribution(name) for name in (
+        "hydrogen", "fcs", "battery", "edu", "soc"
+    ))
+    return driving_reward, energy_reward
+
+
 def make_agent(name, obs_dim, action_dim, config, seed):
     if name.lower() == "sac":
-        return SAC(obs_dim, action_dim, config, seed)
+        return TwoAgentSAC(config, seed)
     if name.lower() == "td3":
         return TD3(obs_dim, action_dim, config, seed)
     raise ValueError(f"Unknown algorithm {name!r}; choose sac or td3")
@@ -346,9 +395,18 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
         termination_reason = None
         truncation_reason = None
         while True:
-            norm_obs = normalize_observation(obs, vehicle_cfg)
-            action_unit = agent.select_action(norm_obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(map_action(action_unit, env.action_space))
+            if isinstance(agent, TwoAgentSAC):
+                driving_state, energy_state = split_agent_observations(obs, vehicle_cfg)
+                driving_action = agent.driving.select_action(driving_state, deterministic=True)
+                energy_action = agent.energy.select_action(energy_state, deterministic=True)
+                physical_action = map_split_actions(
+                    driving_action, energy_action, env.action_space
+                )
+            else:
+                norm_obs = normalize_observation(obs, vehicle_cfg)
+                action_unit = agent.select_action(norm_obs, deterministic=True)
+                physical_action = map_action(action_unit, env.action_space)
+            obs, reward, terminated, truncated, info = env.step(physical_action)
             total += reward
             hydrogen += info.get("hydrogen_consumed_g", 0.0)
             collisions += info.get("collision_count", 0)
@@ -391,6 +449,8 @@ def main(argv=None):
     parser.add_argument("--config", default="config/default.json")
     parser.add_argument("--algorithm", choices=["sac", "td3"], default=None)
     parser.add_argument("--episodes", type=int, default=None)
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Override the SAC/TD3 discount factor for this run")
     parser.add_argument("--max-steps", type=int, default=None, help="Optional per-episode smoke-test cap")
     parser.add_argument("--learning-starts", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -401,6 +461,8 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--output-root", default="results")
+    parser.add_argument("--experiment-name", default=None,
+                        help="Optional label included in this run's unique output directory")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parent
@@ -421,6 +483,8 @@ def main(argv=None):
     tr["episodes"] = episodes
     tr["learning_starts"] = learning_starts
     tr["batch_size"] = batch_size
+    if args.gamma is not None:
+        tr["gamma"] = float(args.gamma)
     cfg["training"].update(tr)
     if args.gui:
         cfg["sumo"]["gui"] = True
@@ -429,8 +493,20 @@ def main(argv=None):
     seed_everything(seed)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    run_dir = (root / args.output_root / f"{algorithm_name}_{stamp}_seed{seed}").resolve()
+    run_name = f"{algorithm_name}_{stamp}_seed{seed}"
+    if args.experiment_name:
+        experiment_label = re.sub(r"[^A-Za-z0-9._-]+", "_", args.experiment_name).strip("._-")
+        if not experiment_label:
+            raise ValueError("--experiment-name must contain at least one letter or number")
+        run_name = f"{algorithm_name}_{experiment_label}_{stamp}_seed{seed}"
+    run_dir = (root / args.output_root / run_name).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
+    # Every process owns its SUMO XML and network files. This prevents concurrent
+    # ablation/evaluation runs from overwriting one another's generated scenario.
+    cfg["sumo"]["scenario_output_dir"] = str(run_dir / "scenario")
+    cfg["training"]["agent_topology"] = (
+        "independent_driving_and_energy_sac" if algorithm_name == "sac" else "single_agent"
+    )
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     with (run_dir / "checkpoint_policy.json").open("w", encoding="utf-8") as f:
@@ -440,6 +516,7 @@ def main(argv=None):
             "final_checkpoint": "final_episode_<episode_count>.pt",
             "rolling_recovery_checkpoint": "final.pt",
             "checkpoint_contents": "full agent and optimizer state",
+            "sac_agents": ["driving", "energy_management"] if algorithm_name == "sac" else ["joint"],
         }, f, indent=2)
     top_reward_checkpoints = []
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
@@ -451,10 +528,27 @@ def main(argv=None):
         device_label = f"{torch.cuda.get_device_name(agent.device)} (CUDA)"
     else:
         device_label = str(agent.device).upper()
-    replay_mb = agent.replay.data.numel() * agent.replay.data.element_size() / (1024 ** 2)
+    if isinstance(agent, TwoAgentSAC):
+        replay_agents = agent.agents
+        replay_mb = sum(
+            subagent.replay.data.numel() * subagent.replay.data.element_size()
+            for subagent in replay_agents.values()
+        ) / (1024 ** 2)
+        replay_device_label = ", ".join(
+            f"{name}={subagent.replay.device}"
+            for name, subagent in replay_agents.items()
+        )
+    else:
+        replay_mb = agent.replay.data.numel() * agent.replay.data.element_size() / (1024 ** 2)
+        replay_device_label = str(agent.replay.device)
     print(
-        f"Training on {device_label}; replay buffer on {agent.replay.device} "
+        f"Training on {device_label}; replay buffers on {replay_device_label} "
         f"({replay_mb:.1f} MiB); SUMO/environment remains CPU-driven."
+    )
+    print(
+        f"Run directory: {run_dir}; topology={cfg['training']['agent_topology']}; "
+        f"gamma={tr['gamma']}; seed={seed}",
+        flush=True,
     )
     global_step = 0
     best_return = -float("inf")
@@ -466,7 +560,11 @@ def main(argv=None):
             # signals and the lead-vehicle stop plan use the same scene seed.
             obs, reset_info = env.reset(seed=seed)
             state = normalize_observation(obs, cfg["vehicle"])
+            if isinstance(agent, TwoAgentSAC):
+                driving_state, energy_state = split_agent_observations(obs, cfg["vehicle"])
             total_return = 0.0
+            total_driving_return = 0.0
+            total_energy_return = 0.0
             total_hydrogen = 0.0
             reward_component_totals = {name: 0.0 for name in REWARD_COMPONENTS}
             total_safety_violations = 0
@@ -483,18 +581,63 @@ def main(argv=None):
             updates = []
             local_step = 0
             while True:
-                if global_step < learning_starts:
-                    action_unit = np.random.uniform(-1.0, 1.0, size=env.action_space.shape[0]).astype(np.float32)
+                energy_observed_acceleration = (
+                    float(energy_state[0]) if isinstance(agent, TwoAgentSAC) else None
+                )
+                if isinstance(agent, TwoAgentSAC):
+                    if global_step < learning_starts:
+                        driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                        energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                    else:
+                        driving_action_unit = agent.driving.select_action(
+                            driving_state, deterministic=False
+                        )
+                        energy_action_unit = agent.energy.select_action(
+                            energy_state, deterministic=False
+                        )
+                    action_unit = np.asarray(
+                        [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
+                    )
+                    physical_action = map_split_actions(
+                        driving_action_unit, energy_action_unit, env.action_space
+                    )
                 else:
-                    action_unit = agent.select_action(state, deterministic=False)
-                    if algorithm_name == "td3":
-                        noise = np.random.normal(0.0, tr["exploration_noise"], size=action_unit.shape)
-                        action_unit = np.clip(action_unit + noise, -1.0, 1.0)
-                physical_action = map_action(action_unit, env.action_space)
+                    if global_step < learning_starts:
+                        action_unit = np.random.uniform(-1.0, 1.0, size=env.action_space.shape[0]).astype(np.float32)
+                    else:
+                        action_unit = agent.select_action(state, deterministic=False)
+                        if algorithm_name == "td3":
+                            noise = np.random.normal(0.0, tr["exploration_noise"], size=action_unit.shape)
+                            action_unit = np.clip(action_unit + noise, -1.0, 1.0)
+                    physical_action = map_action(action_unit, env.action_space)
                 next_obs, reward, terminated, truncated, info = env.step(physical_action)
                 next_state = normalize_observation(next_obs, cfg["vehicle"])
                 done = terminated or truncated
-                agent.replay.add(state, action_unit, reward, next_state, done)
+                if isinstance(agent, TwoAgentSAC):
+                    next_driving_state, next_energy_state = split_agent_observations(
+                        next_obs, cfg["vehicle"]
+                    )
+                    executed_acceleration = info.get("executed_acceleration_m_s2")
+                    if executed_acceleration is not None:
+                        next_energy_state[0] = float(executed_acceleration)
+                    driving_reward, energy_reward = split_agent_rewards(info)
+                    if not np.isclose(driving_reward + energy_reward, reward, atol=1e-6):
+                        raise RuntimeError(
+                            "Driving and energy rewards do not sum to the environment reward"
+                        )
+                    agent.driving.replay.add(
+                        driving_state, driving_action_unit,
+                        driving_reward, next_driving_state, done,
+                    )
+                    agent.energy.replay.add(
+                        energy_state, energy_action_unit,
+                        energy_reward, next_energy_state, done,
+                    )
+                    driving_state, energy_state = next_driving_state, next_energy_state
+                    total_driving_return += driving_reward
+                    total_energy_return += energy_reward
+                else:
+                    agent.replay.add(state, action_unit, reward, next_state, done)
                 state = next_state
                 total_return += reward
                 total_hydrogen += info.get("hydrogen_consumed_g", 0.0)
@@ -504,8 +647,14 @@ def main(argv=None):
                 collision_events += int(info.get("collision_event", False))
                 red_light_violations += int(info.get("red_light_violation", False))
                 speeding_violations += int(info.get("speeding_violation", False))
-                traffic_lights_passed = int(info.get("traffic_lights_passed", 0))
-                lead_traffic_lights_passed = int(info.get("lead_traffic_lights_passed", 0))
+                # Keep the last cumulative count if a terminal info dict omits
+                # it; a missing field must not reset an episode total to zero.
+                traffic_lights_passed = int(
+                    info.get("traffic_lights_passed", traffic_lights_passed)
+                )
+                lead_traffic_lights_passed = int(
+                    info.get("lead_traffic_lights_passed", lead_traffic_lights_passed)
+                )
                 terminal_penalty_total += info.get("terminal_penalty", 0.0)
                 min_gap = min(min_gap, info.get("following_distance_m", float("inf")))
                 local_step += 1
@@ -517,6 +666,9 @@ def main(argv=None):
                     )
                 trace.append({
                     "time_s": info.get("sumo_time_s"), "reward": reward,
+                    "driving_agent_reward": driving_reward if isinstance(agent, TwoAgentSAC) else None,
+                    "energy_agent_reward": energy_reward if isinstance(agent, TwoAgentSAC) else None,
+                    "energy_agent_observed_executed_acceleration_m_s2": energy_observed_acceleration,
                     "soc": info.get("battery_soc"), "battery_soh": info.get("battery_soh"),
                     "fcs_soh": info.get("fcs_soh"), "edu_soh": info.get("edu_soh"),
                     "core_temperature_c": info.get("battery_core_temperature_c"),
@@ -624,17 +776,25 @@ def main(argv=None):
                     **{f"reward_contribution_{name}": reward_parts.get(f"reward_contribution_{name}")
                        for name in REWARD_COMPONENTS},
                 })
-                if len(agent.replay) >= batch_size and global_step >= learning_starts:
-                    for _ in range(int(tr.get("updates_per_step", 1))):
-                        losses = agent.update(batch_size)
-                        losses["global_step"] = global_step
-                        updates.append(losses)
+                if isinstance(agent, TwoAgentSAC):
+                    subagents = agent.agents
+                else:
+                    subagents = {"joint": agent}
+                for subagent_name, subagent in subagents.items():
+                    if len(subagent.replay) >= batch_size and global_step >= learning_starts:
+                        for _ in range(int(tr.get("updates_per_step", 1))):
+                            losses = subagent.update(batch_size)
+                            losses["agent"] = subagent_name
+                            losses["global_step"] = global_step
+                            updates.append(losses)
                 if terminated or truncated or (args.max_steps is not None and local_step >= args.max_steps):
                     break
             _write_csv(run_dir / f"episode_{episode:04d}_trajectory.csv", trace, TRACE_FIELDS)
             row = {
                 "episode": episode, "seed": seed,
                 "return": total_return, "penalty_magnitude": -total_return,
+                "driving_agent_return": total_driving_return if isinstance(agent, TwoAgentSAC) else None,
+                "energy_agent_return": total_energy_return if isinstance(agent, TwoAgentSAC) else None,
                 "steps": local_step,
                 "hydrogen_g": total_hydrogen, "collisions": collisions,
                 "collision_events": collision_events,
@@ -665,7 +825,7 @@ def main(argv=None):
             row.update({f"reward_component_{name}": value for name, value in reward_component_totals.items()})
             row["reward_component_total"] = sum(reward_component_totals.values())
             _append_csv(run_dir / "episodes.csv", [row], list(row))
-            loss_fields = ["global_step", "critic_loss", "actor_loss", "alpha_loss", "alpha"]
+            loss_fields = ["agent", "global_step", "critic_loss", "actor_loss", "alpha_loss", "alpha"]
             if updates:
                 _append_csv(run_dir / "losses.csv", updates, loss_fields)
             if total_return > best_return:
@@ -683,7 +843,14 @@ def main(argv=None):
             print(
                 f"{algorithm_name.upper()} episode {episode}/{episodes}: "
                 f"return={total_return:.3f}, H2={total_hydrogen:.3f} g, "
-                f"steps={local_step}, clips={total_clips}"
+                f"steps={local_step}, clips={total_clips}, "
+                f"end={info.get('terminated_reason') or info.get('truncated_reason') or 'unknown'}, "
+                f"traffic_lights={traffic_lights_passed}/{lead_traffic_lights_passed}"
+                + (
+                    f", driving_return={total_driving_return:.3f}, "
+                    f"energy_return={total_energy_return:.3f}"
+                    if isinstance(agent, TwoAgentSAC) else ""
+                )
             )
             if episode % int(tr.get("evaluation_interval_episodes", 10)) == 0 and tr.get("evaluation_episodes", 0) > 0:
                 eval_rows = evaluate(
@@ -725,7 +892,18 @@ def main(argv=None):
         "environment_steps": global_step, "elapsed_seconds": elapsed,
         "env_steps_per_second_including_training": global_step / max(elapsed, 1e-9),
         "compute_device": str(agent.device),
-        "replay_device": str(agent.replay.device),
+        "replay_device": (
+            {name: str(subagent.replay.device) for name, subagent in agent.agents.items()}
+            if isinstance(agent, TwoAgentSAC) else str(agent.replay.device)
+        ),
+        "agent_topology": (
+            "independent_driving_and_energy_sac"
+            if isinstance(agent, TwoAgentSAC) else "single_agent"
+        ),
+        "agent_observation_dimensions": (
+            {"driving": 11, "energy": 5}
+            if isinstance(agent, TwoAgentSAC) else {"joint": env.observation_space.shape[0]}
+        ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)
             if agent.device.type == "cuda" else 0.0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+import tempfile
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -73,10 +74,17 @@ def generate_episode_randomization(sumo_cfg: dict, seed: int) -> dict:
     return {"seed": int(seed), "signal_initial_conditions": phases, "lead_stop_plan": stops}
 
 
-def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict) -> Path:
+def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict,
+                   output_dir: Path | str | None = None) -> Path:
     """Build a straight route with exactly the configured number of signal nodes."""
     root = Path(project_root)
-    out = root / "environment" / "scenario" / "generated"
+    configured_output_dir = output_dir or sumo_cfg.get("scenario_output_dir")
+    if configured_output_dir is None:
+        configured_output_dir = tempfile.mkdtemp(prefix="fchev_scenario_")
+    out = Path(configured_output_dir).expanduser()
+    if not out.is_absolute():
+        out = root / out
+    out = out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     node_file = out / "road.nod.xml"
     edge_file = out / "road.edg.xml"

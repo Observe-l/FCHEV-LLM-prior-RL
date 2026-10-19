@@ -278,7 +278,9 @@ class SumoInterface:
             return
         try:
             self.traci.switch(self.label)
-            self.traci.close(wait=False)
+            # Reap the SUMO subprocess before another episode/environment is
+            # launched; otherwise long or parallel runs accumulate zombies.
+            self.traci.close(wait=True)
         finally:
             self.started = False
 

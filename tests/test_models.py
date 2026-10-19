@@ -10,9 +10,16 @@ from scipy.interpolate import RegularGridInterpolator
 
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
+from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv
-from environment.scenario.build_scenario import generate_episode_randomization
-from train import _plot_episode_rewards, map_action
+from environment.scenario.build_scenario import build_scenario, generate_episode_randomization
+from train import (
+    _plot_episode_rewards,
+    map_action,
+    map_split_actions,
+    split_agent_observations,
+    split_agent_rewards,
+)
 from util.aging import FCSDegradation
 from util.battery_model import BatteryModel
 from util.data import ProjectData
@@ -285,6 +292,61 @@ class DataAndPlantTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_two_agent_observations_and_reward_partition(self):
+        observation = np.asarray([
+            0.51, 0.99, 0.98, 0.97, 0.2, 8.0, -0.1, 7.0,
+            42.0, 2.0, 123.0, 3.0, 8.3, 0.0, 321.0,
+        ], dtype=np.float32)
+        driving, energy = split_agent_observations(observation, self.cfg["vehicle"])
+        self.assertEqual(driving.shape, (11,))
+        self.assertEqual(energy.shape, (5,))
+        np.testing.assert_allclose(
+            driving, [0.2, 8.0, -0.1, 7.0, 42.0, 1.0, 123.0, 3.0, 8.3, 0.0, 321.0]
+        )
+        np.testing.assert_allclose(energy, [0.2, 0.51, 0.99, 0.98, 0.97])
+
+        parts = {
+            "reward_contribution_following": 5.0,
+            "reward_contribution_comfort": -0.2,
+            "reward_contribution_zero_speed_negative_accel_penalty": -10.0,
+            "reward_contribution_terminal_penalty": -500.0,
+            "reward_contribution_hydrogen": -1.0,
+            "reward_contribution_fcs": -2.0,
+            "reward_contribution_battery": -3.0,
+            "reward_contribution_edu": -4.0,
+            "reward_contribution_soc": -5.0,
+        }
+        driving_reward, energy_reward = split_agent_rewards({"reward_components": parts})
+        self.assertAlmostEqual(driving_reward, -505.2)
+        self.assertAlmostEqual(energy_reward, -15.0)
+        self.assertAlmostEqual(driving_reward + energy_reward, sum(parts.values()))
+
+    def test_two_agent_sac_dimensions_action_mapping_and_checkpoint(self):
+        agent_cfg = dict(self.cfg["training"])
+        agent_cfg.update({"device": "cpu", "replay_capacity": 16, "hidden_layers": [16]})
+        agent = TwoAgentSAC(agent_cfg, seed=7)
+        self.assertEqual(agent.driving.replay.state_dim, 11)
+        self.assertEqual(agent.driving.replay.action_dim, 1)
+        self.assertEqual(agent.energy.replay.state_dim, 5)
+        self.assertEqual(agent.energy.replay.action_dim, 1)
+
+        class Bounds:
+            low = np.asarray([-1.5, 0.0], dtype=np.float32)
+            high = np.asarray([0.7, 50.0], dtype=np.float32)
+
+        np.testing.assert_allclose(
+            map_split_actions([-0.5], [0.2], Bounds()), [-0.75, 30.0], atol=1e-6
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "pair.pt"
+            agent.save(checkpoint)
+            restored = TwoAgentSAC(agent_cfg, seed=8)
+            restored.load(checkpoint)
+            self.assertEqual(restored.driving.replay.state_dim, 11)
+            self.assertEqual(restored.energy.replay.state_dim, 5)
+            self.assertEqual(restored.driving.select_action(np.zeros(11)).shape, (1,))
+            self.assertEqual(restored.energy.select_action(np.zeros(5)).shape, (1,))
+
     def test_reward_plot_uses_zero_vertical_baseline(self):
         import matplotlib
         matplotlib.use("Agg")
@@ -325,7 +387,8 @@ class DataAndPlantTests(unittest.TestCase):
 class SumoIntegrationTests(unittest.TestCase):
     def test_randomized_scenario_is_seed_reproducible_and_signal_cycle_is_fixed(self):
         with (ROOT / "config" / "default.json").open(encoding="utf-8") as f:
-            sumo_cfg = json.load(f)["sumo"]
+            config = json.load(f)
+        sumo_cfg = config["sumo"]
         first = generate_episode_randomization(sumo_cfg, 731)
         repeated = generate_episode_randomization(sumo_cfg, 731)
         changed = generate_episode_randomization(sumo_cfg, 732)
@@ -339,14 +402,31 @@ class SumoIntegrationTests(unittest.TestCase):
         self.assertTrue(all(50.0 <= stop["duration_s"] <= 100.0 for stop in first["lead_stop_plan"]))
         self.assertTrue(all(100.0 <= stop["position_m"] <= 900.0 for stop in first["lead_stop_plan"]))
 
-        signals = ET.parse(
-            ROOT / "environment" / "scenario" / "generated" / "signals.tll.xml"
-        ).getroot()
+        with tempfile.TemporaryDirectory(prefix="fchev_scenario_test_") as scenario_dir:
+            scenario_cfg = build_scenario(
+                ROOT, sumo_cfg, config["vehicle"], output_dir=scenario_dir
+            )
+            signals = ET.parse(Path(scenario_cfg).parent / "signals.tll.xml").getroot()
         phase_durations = {
             tuple(int(float(phase.attrib["duration"])) for phase in logic.findall("phase"))
             for logic in signals.findall("tlLogic")
         }
         self.assertEqual(phase_durations, {(40, 3, 47)})
+
+    def test_environment_instances_get_isolated_scenario_directories(self):
+        first = FCHEVEnv(project_root=ROOT)
+        second = FCHEVEnv(project_root=ROOT)
+        first_scenario = first.scenario_cfg.parent
+        second_scenario = second.scenario_cfg.parent
+        try:
+            self.assertNotEqual(first_scenario, second_scenario)
+            self.assertTrue((first_scenario / "scenario.sumocfg").is_file())
+            self.assertTrue((second_scenario / "scenario.sumocfg").is_file())
+        finally:
+            first.close()
+            self.assertFalse(first_scenario.exists())
+            self.assertTrue((second_scenario / "scenario.sumocfg").is_file())
+            second.close()
 
     def test_episode_ends_when_lead_reaches_terminal_stop(self):
         env = FCHEVEnv(project_root=ROOT)
@@ -407,7 +487,7 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(reset_info["initial_gap_m"], 10.0, delta=0.02)
             self.assertAlmostEqual(reset_info["gap_diagnostic_threshold_m"], 300.0)
             self.assertAlmostEqual(reset_info["gap_monitor_threshold_m"], 1000.0)
-            route_root = env.project_root / "environment" / "scenario" / "generated" / "vehicles.rou.xml"
+            route_root = env.scenario_cfg.parent / "vehicles.rou.xml"
             route_text = route_root.read_text(encoding="utf-8")
             self.assertIn('id="lead"', route_text)
             self.assertEqual(route_text.count('departSpeed="0.000"'), 2)

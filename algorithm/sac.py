@@ -32,7 +32,7 @@ class SAC:
         self.log_alpha = torch.tensor(0.0, device=self.device, requires_grad=True)
         self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=config.get("temperature_learning_rate", 3e-4))
         self.target_entropy = -float(action_dim)
-        self.gamma = float(config.get("gamma", 0.95))
+        self.gamma = float(config.get("gamma", 0.9999))
         self.tau = float(config.get("tau", 0.005))
         self.replay = ReplayBuffer(
             state_dim, action_dim, config.get("replay_capacity", 100000), seed,
@@ -96,17 +96,23 @@ class SAC:
     def save(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        torch.save(self.checkpoint_state(), path)
+
+    def checkpoint_state(self):
+        return {
             "algorithm": "sac", "actor": self.actor.state_dict(),
             "q1": self.q1.state_dict(), "q2": self.q2.state_dict(),
             "target_q1": self.target_q1.state_dict(), "target_q2": self.target_q2.state_dict(),
             "actor_opt": self.actor_opt.state_dict(), "critic_opt": self.critic_opt.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(), "alpha_opt": self.alpha_opt.state_dict(),
             "update_count": self.update_count, "config": self.cfg,
-        }, path)
+        }
 
     def load(self, path, load_optimizers=False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.load_checkpoint_state(ckpt, load_optimizers=load_optimizers)
+
+    def load_checkpoint_state(self, ckpt, load_optimizers=False):
         self.actor.load_state_dict(ckpt["actor"])
         self.q1.load_state_dict(ckpt["q1"])
         self.q2.load_state_dict(ckpt["q2"])

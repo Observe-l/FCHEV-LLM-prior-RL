@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import tempfile
 
 import gymnasium as gym
 import numpy as np
@@ -77,7 +78,19 @@ class FCHEVEnv(gym.Env):
             ], dtype=np.float32),
             dtype=np.float32,
         )
-        self.scenario_cfg = build_scenario(self.project_root, self.sumo_cfg, self.vehicle_cfg)
+        self._scenario_tmp = None
+        scenario_output_dir = self.sumo_cfg.get("scenario_output_dir")
+        if scenario_output_dir is None:
+            self._scenario_tmp = tempfile.TemporaryDirectory(prefix="fchev_env_scenario_")
+            scenario_output_dir = self._scenario_tmp.name
+        self.scenario_output_dir = Path(scenario_output_dir).expanduser()
+        if not self.scenario_output_dir.is_absolute():
+            self.scenario_output_dir = self.project_root / self.scenario_output_dir
+        self.scenario_output_dir = self.scenario_output_dir.resolve()
+        self.scenario_cfg = build_scenario(
+            self.project_root, self.sumo_cfg, self.vehicle_cfg,
+            output_dir=self.scenario_output_dir,
+        )
         self.sumo = SumoInterface(
             self.project_root, self.scenario_cfg, self.sumo_cfg, self.vehicle_cfg
         )
@@ -455,6 +468,10 @@ class FCHEVEnv(gym.Env):
                 "ego_speed_m_s": float(ego0["speed_m_s"]),
                 "ego_x_m": float(ego0["x_m"]),
                 "following_distance_m": float(states_before.get("gap_m", 30000.0)),
+                # This terminal path returns before advancing SUMO, but the
+                # cumulative crossing counters still describe the episode.
+                "traffic_lights_passed": len(self._ego_passed_tls_ids),
+                "lead_traffic_lights_passed": len(self._lead_passed_tls_ids),
                 "traffic_light_state_observation": float(next_observation[9]),
                 "traffic_light_distance_m": float(next_observation[10]),
                 "traffic_light_remaining_s": float(next_observation[11]),
@@ -802,8 +819,13 @@ class FCHEVEnv(gym.Env):
         return next_observation, float(reward), terminated, truncated, info
 
     def close(self):
-        if hasattr(self, "sumo"):
-            self.sumo.close()
+        try:
+            if hasattr(self, "sumo"):
+                self.sumo.close()
+        finally:
+            if self._scenario_tmp is not None:
+                self._scenario_tmp.cleanup()
+                self._scenario_tmp = None
 
 
 def load_config(path=None):
