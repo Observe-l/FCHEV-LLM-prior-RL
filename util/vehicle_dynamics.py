@@ -24,9 +24,10 @@ def longitudinal_demand(speed_m_s: float, acceleration_m_s2: float, dt_s: float,
     a = float(acceleration_m_s2)
     # Keep the one-step kinematics forward-only; stopping exactly at v=0 is allowed.
     a = max(a, -v / dt) if dt > 0 else a
-    vmax = float(cfg["max_speed_mps"])
-    a = min(a, (vmax - v) / dt) if dt > 0 else a
-    vn = max(0.0, min(vmax, v + a * dt))
+    # Do not replace a positive command with a zero-speed-cap command here.
+    # FCHEVEnv terminates an episode when the requested action would exceed
+    # the configured maximum speed, before this plant calculation is called.
+    vn = max(0.0, v + a * dt)
     # The quasi-steady power is evaluated at the mean shaft speed over this
     # fixed-step transition; this also gives the correct kinetic-energy change.
     vm = 0.5 * (v + vn)

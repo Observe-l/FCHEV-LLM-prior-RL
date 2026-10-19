@@ -35,7 +35,8 @@ class SAC:
         self.gamma = float(config.get("gamma", 0.95))
         self.tau = float(config.get("tau", 0.005))
         self.replay = ReplayBuffer(
-            state_dim, action_dim, config.get("replay_capacity", 100000), seed
+            state_dim, action_dim, config.get("replay_capacity", 100000), seed,
+            device=self.device,
         )
         self.update_count = 0
 
@@ -51,11 +52,6 @@ class SAC:
 
     def update(self, batch_size):
         s, a, r, ns, done = self.replay.sample(batch_size)
-        s = torch.as_tensor(s, device=self.device)
-        a = torch.as_tensor(a, device=self.device)
-        r = torch.as_tensor(r, device=self.device)
-        ns = torch.as_tensor(ns, device=self.device)
-        done = torch.as_tensor(done, device=self.device)
         with torch.no_grad():
             next_action, next_logp = self.actor.sample(ns)
             q_target = torch.minimum(

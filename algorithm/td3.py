@@ -36,7 +36,8 @@ class TD3:
         self.noise_clip = float(config.get("td3_noise_clip", 0.5))
         self.policy_delay = int(config.get("td3_policy_delay", 2))
         self.replay = ReplayBuffer(
-            state_dim, action_dim, config.get("replay_capacity", 100000), seed
+            state_dim, action_dim, config.get("replay_capacity", 100000), seed,
+            device=self.device,
         )
         self.update_count = 0
 
@@ -47,11 +48,6 @@ class TD3:
 
     def update(self, batch_size):
         s, a, r, ns, done = self.replay.sample(batch_size)
-        s = torch.as_tensor(s, device=self.device)
-        a = torch.as_tensor(a, device=self.device)
-        r = torch.as_tensor(r, device=self.device)
-        ns = torch.as_tensor(ns, device=self.device)
-        done = torch.as_tensor(done, device=self.device)
         with torch.no_grad():
             noise = (torch.randn_like(a) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
             next_action = (self.actor_target(ns) + noise).clamp(-1.0, 1.0)

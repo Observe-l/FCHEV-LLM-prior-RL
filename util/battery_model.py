@@ -155,14 +155,14 @@ class BatteryModel:
         n_cycles = 3600.0 * ah20 / self.q_nom_c
         return float(c_rate), float(ah20), float(n_cycles), bool(c_table != c_rate)
 
-    def step(self, requested_power_w: float, dt_s: float) -> BatteryStep:
+    def step(self, requested_power_w: float, dt_s: float, power_limits=None) -> BatteryStep:
         p_req = float(requested_power_w)
         dt = float(dt_s)
         if dt <= 0:
             raise ValueError("Battery time step must be positive")
         direction = "charge" if p_req < 0.0 else "discharge"
         params, clipped = self._electrical_parameters(direction)
-        limits = self._cell_current_limits()
+        limits = power_limits if power_limits is not None else self._cell_current_limits()
         tol = max(1e-5, 1e-8 * max(abs(limits["minimum_power_w"]), abs(limits["maximum_power_w"]), 1.0))
         if p_req < limits["minimum_power_w"] - tol or p_req > limits["maximum_power_w"] + tol:
             raise ValueError(

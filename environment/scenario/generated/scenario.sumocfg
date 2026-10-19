@@ -1,2 +1,2 @@
 <?xml version='1.0' encoding='utf-8'?>
-<configuration><input><net-file value="road.net.xml" /><route-files value="vehicles.rou.xml" /></input><time><begin value="0" /><end value="9" /><step-length value="1.0" /></time></configuration>
+<configuration><input><net-file value="road.net.xml" /><route-files value="vehicles.rou.xml" /></input><time><begin value="0" /><end value="6001" /><step-length value="1.0" /></time></configuration>

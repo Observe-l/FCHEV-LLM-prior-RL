@@ -21,6 +21,7 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=10000)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--hold-gui", action="store_true", help="Keep the SUMO-GUI open after evaluation")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent
     cfg = load_config(root / args.config)
@@ -50,6 +51,8 @@ def main(argv=None):
         for row in rows:
             print(row)
         print(f"Saved evaluation to {out}")
+        if args.gui and args.hold_gui:
+            input("SUMO-GUI is paused at the final state. Press Enter here to close it. ")
     finally:
         env.close()
 

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
 
 @dataclass
@@ -26,14 +25,23 @@ class GridTable:
         self.soc_axis = soc
         self.temp_axis = temp
         self.values = values
-        self._interp = RegularGridInterpolator(
-            (soc, temp), values, method="linear", bounds_error=True
-        )
 
     def query(self, soc: float, temp_c: float) -> ParameterQuery:
         s = float(np.clip(soc, self.soc_axis[0], self.soc_axis[-1]))
         t = float(np.clip(temp_c, self.temp_axis[0], self.temp_axis[-1]))
-        value = float(self._interp([[s, t]])[0])
+        # Equivalent to RegularGridInterpolator(method="linear") for this
+        # 2-D grid, without allocating a query array or entering SciPy for
+        # every scalar R/C lookup at every plant-solver iteration.
+        i = int(np.clip(np.searchsorted(self.soc_axis, s, side="right") - 1, 0, self.soc_axis.size - 2))
+        j = int(np.clip(np.searchsorted(self.temp_axis, t, side="right") - 1, 0, self.temp_axis.size - 2))
+        ds = (s - self.soc_axis[i]) / (self.soc_axis[i + 1] - self.soc_axis[i])
+        dt = (t - self.temp_axis[j]) / (self.temp_axis[j + 1] - self.temp_axis[j])
+        v00 = self.values[i, j]
+        v10 = self.values[i + 1, j]
+        v01 = self.values[i, j + 1]
+        v11 = self.values[i + 1, j + 1]
+        value = float((1.0 - ds) * (1.0 - dt) * v00 + ds * (1.0 - dt) * v10
+                      + (1.0 - ds) * dt * v01 + ds * dt * v11)
         return ParameterQuery(value=value, clipped=(s != soc or t != temp_c))
 
 
