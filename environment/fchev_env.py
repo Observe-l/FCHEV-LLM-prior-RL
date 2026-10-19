@@ -411,9 +411,17 @@ class FCHEVEnv(gym.Env):
             self._step_count += 1
             next_observation = self._observation(states_before)
             self._last_state = states_before
+            terminal_penalty = float(
+                self.config["reward"].get(
+                    "abnormal_termination_penalty",
+                    self.config["reward"].get(
+                        "collision_red_light_terminal_penalty", -500.0
+                    ),
+                )
+            )
             self._last_reward_components = {
-                "terminal_penalty": 0.0,
-                "reward_contribution_terminal_penalty": 0.0,
+                "terminal_penalty": terminal_penalty,
+                "reward_contribution_terminal_penalty": terminal_penalty,
             }
             info = {
                 "sumo_time_s": states_before["time_s"],
@@ -437,7 +445,10 @@ class FCHEVEnv(gym.Env):
                 "red_light_violation": False,
                 "speeding_violation": False,
                 "speeding_vehicles": [],
-                "terminal_penalty": 0.0,
+                "terminal_penalty": terminal_penalty,
+                "collision_penalty": 0.0,
+                "speed_limit_positive_accel_penalty": 0.0,
+                "zero_speed_negative_accel_penalty": 0.0,
                 "abnormal_termination": True,
                 "terminated_reason": "max_speed_action",
                 "truncated_reason": None,
@@ -452,7 +463,7 @@ class FCHEVEnv(gym.Env):
                 "distance_to_next_speed_region_m": float(next_observation[14]),
                 "reward_components": dict(self._last_reward_components),
             }
-            return next_observation, 0.0, True, False, info
+            return next_observation, terminal_penalty, True, False, info
 
         tls = states_before.get("next_tls")
         lead_tls_before = states_before.get("lead_next_tls")
@@ -601,8 +612,18 @@ class FCHEVEnv(gym.Env):
             "soc_penalty": abs(self.battery.state.soc - self.config["reward"]["target_soc"]),
         }
         reward = compute_reward(reward_parts, self.config["reward"])
-        # Collision, overlap, and speed violations terminate the episode but
-        # do not add an event-specific reward penalty.
+        zero_speed_negative_accel_penalty = 0.0
+        if ego0["speed_m_s"] <= 1e-6 and requested_accel < -1e-9:
+            zero_speed_negative_accel_penalty = float(
+                self.config["reward"].get("zero_speed_negative_accel_penalty", -10.0)
+            )
+        reward_parts["zero_speed_negative_accel_penalty"] = (
+            zero_speed_negative_accel_penalty
+        )
+        reward_parts["reward_contribution_zero_speed_negative_accel_penalty"] = (
+            zero_speed_negative_accel_penalty
+        )
+        reward += zero_speed_negative_accel_penalty
         collision_penalty = 0.0
         speed_limit_positive_accel_penalty = 0.0
         p_dc_loss = dispatch["fcs_power_kw"] * 1000.0 * (1.0 - self.config["fcs"]["dc_dc_efficiency"])
@@ -657,9 +678,16 @@ class FCHEVEnv(gym.Env):
         terminated = termination_reason is not None
         truncated = not terminated and self._step_count >= int(self.sumo_cfg["episode_limit_s"])
         terminal_penalty = 0.0
-        if termination_reason in ("collision", "red_light_violation", "speeding"):
+        if termination_reason in (
+            "collision", "red_light_violation", "speeding", "max_speed_action"
+        ):
             terminal_penalty = float(
-                self.config["reward"]["collision_red_light_terminal_penalty"]
+                self.config["reward"].get(
+                    "abnormal_termination_penalty",
+                    self.config["reward"].get(
+                        "collision_red_light_terminal_penalty", -500.0
+                    ),
+                )
             )
         reward_parts["terminal_penalty"] = terminal_penalty
         reward_parts["reward_contribution_terminal_penalty"] = terminal_penalty
@@ -741,6 +769,7 @@ class FCHEVEnv(gym.Env):
             "terminal_penalty": terminal_penalty,
             "collision_penalty": collision_penalty,
             "speed_limit_positive_accel_penalty": speed_limit_positive_accel_penalty,
+            "zero_speed_negative_accel_penalty": zero_speed_negative_accel_penalty,
             "safety_violations": int(safety_violation),
             "constraint_clipping": bool(
                 not np.array_equal(bounded, requested_raw)

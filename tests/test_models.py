@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -10,7 +12,7 @@ from algorithm.sac import SAC
 from algorithm.td3 import TD3
 from environment.fchev_env import FCHEVEnv
 from environment.scenario.build_scenario import generate_episode_randomization
-from train import map_action
+from train import _plot_episode_rewards, map_action
 from util.aging import FCSDegradation
 from util.battery_model import BatteryModel
 from util.data import ProjectData
@@ -283,6 +285,27 @@ class DataAndPlantTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_reward_plot_uses_zero_vertical_baseline(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            episodes_csv = root / "episodes.csv"
+            episodes_csv.write_text(
+                "episode,return\n1,-75\n2,25\n", encoding="utf-8"
+            )
+            output_png = root / "reward.png"
+            with patch("matplotlib.axes.Axes.set_ylim") as set_ylim:
+                _plot_episode_rewards(episodes_csv, output_png)
+            self.assertTrue(output_png.exists())
+            self.assertTrue(any(
+                call.kwargs.get("bottom") == 0.0
+                for call in set_ylim.call_args_list
+            ))
+        self.assertEqual(self.cfg["reward"]["abnormal_termination_penalty"], -500.0)
+
     def test_sac_and_td3_update(self):
         cfg = dict(self.cfg["training"])
         cfg["replay_capacity"] = 32
@@ -455,17 +478,21 @@ class SumoIntegrationTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_negative_acceleration_from_rest_is_clipped_without_extra_penalty(self):
+    def test_negative_acceleration_from_rest_is_clipped_with_minus_ten_penalty(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             obs, _ = env.reset(seed=23)
             self.assertAlmostEqual(float(obs[5]), 0.0, places=6)
             self.assertAlmostEqual(float(obs[7]), 0.0, places=6)
-            _, neutral_reward, terminated, truncated, _ = env.step(
+            _, neutral_reward, terminated, truncated, neutral_info = env.step(
                 np.asarray([0.0, 0.0])
             )
             self.assertFalse(terminated)
             self.assertFalse(truncated)
+            self.assertEqual(
+                neutral_info["reward_components"]["zero_speed_negative_accel_penalty"],
+                0.0,
+            )
             env.reset(seed=23)
             _, reward, terminated, truncated, info = env.step(
                 np.asarray([-0.5, 0.0])
@@ -475,10 +502,17 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(info["requested_acceleration_m_s2"], -0.5)
             self.assertTrue(info["no_reverse_clip"])
             self.assertAlmostEqual(info["executed_acceleration_m_s2"], 0.0, places=6)
-            self.assertNotIn(
-                "zero_speed_negative_accel_penalty", info["reward_components"]
+            self.assertEqual(
+                info["reward_components"]["zero_speed_negative_accel_penalty"],
+                -10.0,
             )
-            self.assertAlmostEqual(reward, neutral_reward, places=6)
+            self.assertEqual(
+                info["reward_components"][
+                    "reward_contribution_zero_speed_negative_accel_penalty"
+                ],
+                -10.0,
+            )
+            self.assertAlmostEqual(reward, neutral_reward - 10.0, places=6)
             self.assertAlmostEqual(
                 reward,
                 sum(v for k, v in info["reward_components"].items()
@@ -496,8 +530,9 @@ class SumoIntegrationTests(unittest.TestCase):
             )
             self.assertFalse(terminated)
             self.assertFalse(truncated)
-            self.assertNotIn(
-                "zero_speed_negative_accel_penalty", moving_info["reward_components"]
+            self.assertEqual(
+                moving_info["reward_components"]["zero_speed_negative_accel_penalty"],
+                0.0,
             )
         finally:
             env.close()
@@ -529,7 +564,12 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertFalse(info["speed_limit_clip"])
             self.assertAlmostEqual(info["requested_acceleration_m_s2"], 0.7)
             self.assertIsNone(info["executed_acceleration_m_s2"])
-            self.assertEqual(reward, 0.0)
+            self.assertEqual(info["terminal_penalty"], -500.0)
+            self.assertEqual(
+                info["reward_components"]["reward_contribution_terminal_penalty"],
+                -500.0,
+            )
+            self.assertEqual(reward, -500.0)
             self.assertEqual(env.sumo.step_calls, step_calls_before)
             self.assertEqual(env.sumo.traci.simulation.getTime(), time_before)
         finally:
@@ -571,13 +611,14 @@ class SumoIntegrationTests(unittest.TestCase):
                 env.sumo.collision_ids = original_collision_ids
             self.assertTrue(terminated)
             self.assertFalse(truncated)
-            self.assertNotEqual(reward, -35.0)
             self.assertEqual(info["terminated_reason"], "collision")
             self.assertTrue(info["collision_event"])
-            self.assertEqual(info["terminal_penalty"], 0.0)
+            self.assertEqual(info["terminal_penalty"], -500.0)
             self.assertEqual(info["collision_penalty"], 0.0)
-            self.assertNotIn("collision_penalty", info["reward_components"])
-            self.assertEqual(info["reward_components"]["reward_contribution_terminal_penalty"], 0.0)
+            self.assertEqual(
+                info["reward_components"]["reward_contribution_terminal_penalty"],
+                -500.0,
+            )
             self.assertAlmostEqual(
                 reward,
                 sum(v for k, v in info["reward_components"].items()
@@ -603,14 +644,15 @@ class SumoIntegrationTests(unittest.TestCase):
                 env.sumo.states = original_states
             self.assertTrue(terminated)
             self.assertFalse(truncated)
-            self.assertNotEqual(reward, -35.0)
             self.assertEqual(info["terminated_reason"], "collision")
             self.assertTrue(info["gap_overlap"])
             self.assertTrue(info["collision_event"])
-            self.assertEqual(info["terminal_penalty"], 0.0)
+            self.assertEqual(info["terminal_penalty"], -500.0)
             self.assertEqual(info["collision_penalty"], 0.0)
-            self.assertNotIn("collision_penalty", info["reward_components"])
-            self.assertEqual(info["reward_components"]["reward_contribution_terminal_penalty"], 0.0)
+            self.assertEqual(
+                info["reward_components"]["reward_contribution_terminal_penalty"],
+                -500.0,
+            )
             self.assertAlmostEqual(
                 reward,
                 sum(v for k, v in info["reward_components"].items()
@@ -702,7 +744,7 @@ class SumoIntegrationTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_intersection_speeding_terminates_without_event_penalty(self):
+    def test_intersection_speeding_terminates_with_minus_500_penalty(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=143)
@@ -726,13 +768,13 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertEqual(info["terminated_reason"], "speeding")
             self.assertTrue(info["speeding_violation"])
             self.assertIn("ego", info["speeding_vehicles"])
-            self.assertEqual(info["terminal_penalty"], 0.0)
+            self.assertEqual(info["terminal_penalty"], -500.0)
             self.assertEqual(info["collision_penalty"], 0.0)
             self.assertEqual(info["speed_limit_positive_accel_penalty"], 0.0)
         finally:
             env.close()
 
-    def test_red_light_crossing_terminates_with_configured_penalty(self):
+    def test_red_light_crossing_terminates_with_minus_500_penalty(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=56)
@@ -753,9 +795,12 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertFalse(truncated)
             self.assertEqual(info["terminated_reason"], "red_light_violation")
             self.assertTrue(info["red_light_violation"])
-            self.assertEqual(info["terminal_penalty"], 0.0)
+            self.assertEqual(info["terminal_penalty"], -500.0)
             self.assertEqual(info["collision_penalty"], 0.0)
-            self.assertEqual(info["reward_components"]["reward_contribution_terminal_penalty"], 0.0)
+            self.assertEqual(
+                info["reward_components"]["reward_contribution_terminal_penalty"],
+                -500.0,
+            )
             self.assertAlmostEqual(
                 reward,
                 sum(v for k, v in info["reward_components"].items()

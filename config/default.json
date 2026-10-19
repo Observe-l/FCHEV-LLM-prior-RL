@@ -103,7 +103,8 @@
     "following_c1": 10.0,
     "following_c2": 3.0,
     "following_c3": 0.05,
-    "collision_red_light_terminal_penalty": 0.0
+    "abnormal_termination_penalty": -500.0,
+    "zero_speed_negative_accel_penalty": -10.0
   },
   "training": {
     "algorithm": "sac",

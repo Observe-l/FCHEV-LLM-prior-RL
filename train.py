@@ -70,10 +70,12 @@ TRACE_FIELDS = [
     "reward_contribution_fcs", "reward_contribution_battery",
     "reward_contribution_edu", "reward_contribution_comfort", "reward_contribution_soc",
     "reward_contribution_terminal_penalty",
+    "zero_speed_negative_accel_penalty",
+    "reward_contribution_zero_speed_negative_accel_penalty",
 ]
 REWARD_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
-    "terminal_penalty",
+    "terminal_penalty", "zero_speed_negative_accel_penalty",
 )
 REWARD_BETA_COMPONENTS = ("hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc")
 
@@ -138,6 +140,56 @@ def _append_csv(path: Path, rows, fields):
         writer.writerows(rows)
 
 
+def _atomic_save_agent(agent, path: Path):
+    """Write a checkpoint atomically so an interrupted save cannot clobber it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        agent.save(temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _write_top_checkpoint_manifest(path: Path, checkpoints):
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as f:
+            json.dump(checkpoints, f, indent=2)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _consider_top_reward_checkpoint(agent, run_dir: Path, episode: int,
+                                    episode_return: float, checkpoints, limit=5):
+    """Keep model snapshots for the five highest-return completed episodes."""
+    ranked = sorted(checkpoints, key=lambda row: (-row["return"], row["episode"]))
+    if len(ranked) >= limit and episode_return <= ranked[limit - 1]["return"]:
+        return ranked
+
+    return_token = f"{episode_return:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
+    filename = f"top_reward_episode_{episode:04d}_return_{return_token}.pt"
+    checkpoint_path = run_dir / filename
+    _atomic_save_agent(agent, checkpoint_path)
+    ranked.append({
+        "episode": int(episode),
+        "return": float(episode_return),
+        "checkpoint": filename,
+    })
+    ranked.sort(key=lambda row: (-row["return"], row["episode"]))
+    removed = ranked[limit:]
+    ranked = ranked[:limit]
+    for row in removed:
+        stale_path = run_dir / row["checkpoint"]
+        if stale_path.exists():
+            stale_path.unlink()
+    _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", ranked)
+    return ranked
+
+
 def _plot_episode_rewards(episodes_csv: Path, output_png: Path, window: int = 10):
     """Save raw episode returns and a trailing moving average."""
     import matplotlib
@@ -150,13 +202,13 @@ def _plot_episode_rewards(episodes_csv: Path, output_png: Path, window: int = 10
         return
     episodes = np.asarray([int(row["episode"]) for row in rows], dtype=np.int32)
     rewards = np.asarray([float(row["return"]) for row in rows], dtype=np.float64)
-    display_floor = -200.0
+    display_floor = 0.0
     window = max(1, min(int(window), len(rewards)))
     moving = np.convolve(rewards, np.ones(window) / window, mode="valid")
 
     fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
-    # Values below the fixed visible range remain intact in episodes.csv but
-    # are drawn at the lower boundary so they cannot distort the autoscaled top.
+    # Negative returns remain intact in episodes.csv and are shown at zero so
+    # the plot can use the requested zero baseline.
     ax.plot(episodes, np.maximum(rewards, display_floor), color="#4C78A8", alpha=0.45, linewidth=1.0,
             label="Episode reward")
     ax.plot(episodes[window - 1:], np.maximum(moving, display_floor), color="#E45756", linewidth=2.0,
@@ -165,9 +217,9 @@ def _plot_episode_rewards(episodes_csv: Path, output_png: Path, window: int = 10
     ax.set_ylabel("Episode reward (sum of per-step rewards)")
     ax.set_title("SAC training reward")
     ax.grid(True, alpha=0.25)
-    # Keep the requested lower limit fixed; leave the upper limit data-driven.
+    # Keep the requested zero lower limit; leave the upper limit data-driven.
     ax.set_ylim(bottom=display_floor)
-    ax.text(0.99, 0.02, "Values below -200 are clipped; see episodes.csv for raw returns",
+    ax.text(0.99, 0.02, "Negative returns are shown at 0; see episodes.csv for raw returns",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8, color="#555555")
     ax.legend()
     fig.savefig(output_png, dpi=160)
@@ -381,6 +433,16 @@ def main(argv=None):
     run_dir.mkdir(parents=True, exist_ok=False)
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    with (run_dir / "checkpoint_policy.json").open("w", encoding="utf-8") as f:
+        json.dump({
+            "top_reward_checkpoints": 5,
+            "ranking_metric": "episode return",
+            "final_checkpoint": "final_episode_<episode_count>.pt",
+            "rolling_recovery_checkpoint": "final.pt",
+            "checkpoint_contents": "full agent and optimizer state",
+        }, f, indent=2)
+    top_reward_checkpoints = []
+    _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
 
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
     agent = make_agent(algorithm_name, env.observation_space.shape[0], env.action_space.shape[0], tr, seed)
@@ -547,6 +609,9 @@ def main(argv=None):
                     "reward_comfort": reward_parts.get("comfort"),
                     "reward_following": reward_parts.get("following"),
                     "reward_soc_penalty": reward_parts.get("soc_penalty"),
+                    "zero_speed_negative_accel_penalty": reward_parts.get(
+                        "zero_speed_negative_accel_penalty"
+                    ),
                     "reward_cost_following": reward_parts.get("cost_following"),
                     "reward_cost_hydrogen_g": reward_parts.get("cost_hydrogen"),
                     "reward_cost_fcs_degradation_percent": reward_parts.get("cost_fcs"),
@@ -605,9 +670,16 @@ def main(argv=None):
                 _append_csv(run_dir / "losses.csv", updates, loss_fields)
             if total_return > best_return:
                 best_return = total_return
-                agent.save(run_dir / "best.pt")
+                _atomic_save_agent(agent, run_dir / "best.pt")
+            top_reward_checkpoints = _consider_top_reward_checkpoint(
+                agent, run_dir, episode, total_return, top_reward_checkpoints, limit=5
+            )
             if episode % int(tr.get("save_interval_episodes", 10)) == 0 or episode == episodes:
-                agent.save(run_dir / "final.pt")
+                _atomic_save_agent(agent, run_dir / "final.pt")
+                if episode == episodes:
+                    _atomic_save_agent(
+                        agent, run_dir / f"final_episode_{episode:04d}.pt"
+                    )
             print(
                 f"{algorithm_name.upper()} episode {episode}/{episodes}: "
                 f"return={total_return:.3f}, H2={total_hydrogen:.3f} g, "
