@@ -9,13 +9,14 @@ import torch
 
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
+from algorithm.hasac import HASAC
 from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
 from train import evaluate, seed_everything
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Evaluate a saved SAC/TD3 FCHEV policy")
+    parser = argparse.ArgumentParser(description="Evaluate a saved HASAC/SAC/TD3 FCHEV policy")
     parser.add_argument("checkpoint")
     parser.add_argument("--config", default="config/default.json")
     parser.add_argument("--episodes", type=int, default=10)
@@ -37,6 +38,8 @@ def main(argv=None):
     algorithm = ckpt.get("algorithm", "sac")
     if algorithm == "two_agent_sac":
         agent = TwoAgentSAC(algo_cfg, args.seed)
+    elif algorithm == "hasac":
+        agent = HASAC(algo_cfg, args.seed)
     else:
         cls = SAC if algorithm == "sac" else TD3
         agent = cls(env.observation_space.shape[0], env.action_space.shape[0], algo_cfg, args.seed)

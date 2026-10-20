@@ -17,6 +17,7 @@ import torch
 
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
+from algorithm.hasac import HASAC
 from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
 from util.observation import normalize_observation
@@ -46,11 +47,15 @@ TRACE_FIELDS = [
     "dc_bus_dump_power_w", "collision_count", "collision_event", "gap_overlap",
     "red_light_violation", "speeding_violation", "speeding_vehicles",
     "ego_in_intersection_speed_zone", "lead_in_intersection_speed_zone",
-    "intersection_speed_limit_m_s", "traffic_light_crossing",
+    "intersection_speed_limit_m_s", "active_speed_limit_m_s",
+    "speeding_delta_v_m_s", "speeding_penalty_beta", "speeding_penalty",
+    "traffic_light_crossing",
     "traffic_light_crossed_id", "traffic_lights_passed",
     "lead_traffic_light_crossing", "lead_traffic_light_crossed_id",
     "lead_traffic_lights_passed", "traffic_light_state", "traffic_light_distance_m",
-    "traffic_light_remaining_s",
+    "traffic_light_remaining_s", "time_to_traffic_light_s",
+    "traffic_light_reward_active", "traffic_light_reward",
+    "traffic_light_reward_contribution",
     "current_speed_limit_m_s", "next_speed_limit_m_s",
     "distance_to_next_speed_region_m", "max_speed_action_violation",
     "gap_over_diagnostic_threshold", "gap_over_monitor_threshold",
@@ -64,24 +69,30 @@ TRACE_FIELDS = [
     "reward_fcs_degradation_increment",
     "reward_battery_soh_loss", "reward_edu_clr_cumulative",
     "reward_edu_clr_increment",
-    "reward_comfort", "reward_following", "reward_soc_penalty",
+    "reward_comfort", "reward_following", "reward_speeding", "reward_soc_penalty",
     "reward_cost_following", "reward_cost_hydrogen_g",
     "reward_cost_fcs_degradation_percent", "reward_cost_battery_soh_loss_percent",
     "reward_cost_edu_degradation_percent", "reward_cost_comfort", "reward_cost_soc",
     "reward_beta_following", "reward_beta_hydrogen", "reward_beta_fcs",
     "reward_beta_battery", "reward_beta_edu", "reward_beta_comfort", "reward_beta_soc",
+    "reward_beta_traffic_light", "reward_beta_speeding",
     "reward_contribution_following", "reward_contribution_hydrogen",
     "reward_contribution_fcs", "reward_contribution_battery",
     "reward_contribution_edu", "reward_contribution_comfort", "reward_contribution_soc",
+    "reward_contribution_traffic_light", "reward_contribution_speeding",
     "reward_contribution_terminal_penalty",
     "zero_speed_negative_accel_penalty",
     "reward_contribution_zero_speed_negative_accel_penalty",
 ]
 REWARD_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
-    "terminal_penalty", "zero_speed_negative_accel_penalty",
+    "traffic_light", "speeding", "terminal_penalty",
+    "zero_speed_negative_accel_penalty",
 )
-REWARD_BETA_COMPONENTS = ("hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc")
+REWARD_BETA_COMPONENTS = (
+    "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
+    "traffic_light", "speeding",
+)
 DRIVING_OBSERVATION_INDICES = (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 ENERGY_OBSERVATION_INDICES = (0, 1, 2, 3)
 
@@ -151,7 +162,8 @@ def split_agent_rewards(info):
         return float(rewards.get(f"reward_contribution_{name}", 0.0) or 0.0)
 
     driving_reward = sum(contribution(name) for name in (
-        "following", "comfort", "zero_speed_negative_accel_penalty", "terminal_penalty"
+        "following", "comfort", "traffic_light", "speeding",
+        "zero_speed_negative_accel_penalty", "terminal_penalty"
     ))
     energy_reward = sum(contribution(name) for name in (
         "hydrogen", "fcs", "battery", "edu", "soc"
@@ -159,12 +171,18 @@ def split_agent_rewards(info):
     return driving_reward, energy_reward
 
 
+def is_dual_policy_agent(agent):
+    return isinstance(agent, (TwoAgentSAC, HASAC))
+
+
 def make_agent(name, obs_dim, action_dim, config, seed):
     if name.lower() == "sac":
         return TwoAgentSAC(config, seed)
+    if name.lower() == "hasac":
+        return HASAC(config, seed)
     if name.lower() == "td3":
         return TD3(obs_dim, action_dim, config, seed)
-    raise ValueError(f"Unknown algorithm {name!r}; choose sac or td3")
+    raise ValueError(f"Unknown algorithm {name!r}; choose hasac, sac or td3")
 
 
 def _write_csv(path: Path, rows, fields=None):
@@ -275,6 +293,41 @@ def _plot_episode_rewards(episodes_csv: Path, output_png: Path, window: int = 10
     plt.close(fig)
 
 
+def _plot_agent_episode_rewards(
+    episodes_csv: Path,
+    output_png: Path,
+    reward_field: str,
+    agent_label: str,
+    window: int = 10,
+):
+    """Plot one independent agent's raw episode returns and moving average."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    with episodes_csv.open("r", newline="", encoding="utf-8") as f:
+        rows = [row for row in csv.DictReader(f) if row.get(reward_field) not in (None, "")]
+    if not rows:
+        return
+    episodes = np.asarray([int(row["episode"]) for row in rows], dtype=np.int32)
+    rewards = np.asarray([float(row[reward_field]) for row in rows], dtype=np.float64)
+    window = max(1, min(int(window), len(rewards)))
+    moving = np.convolve(rewards, np.ones(window) / window, mode="valid")
+
+    fig, ax = plt.subplots(figsize=(9, 5), constrained_layout=True)
+    ax.plot(episodes, rewards, color="#4C78A8", alpha=0.45, linewidth=1.0,
+            label="Episode reward")
+    ax.plot(episodes[window - 1:], moving, color="#E45756", linewidth=2.0,
+            label=f"{window}-episode moving average")
+    ax.set_xlabel("Episode")
+    ax.set_ylabel("Episode reward (sum of per-step rewards)")
+    ax.set_title(f"{agent_label} SAC training reward")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.savefig(output_png, dpi=160)
+    plt.close(fig)
+
+
 def _read_episode_rows(episodes_csv: Path):
     with episodes_csv.open("r", newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
@@ -362,7 +415,7 @@ def _plot_reward_components(episodes_csv: Path, output_png: Path, window: int = 
     fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
     colors = (
         "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2",
-        "#FF9DA6", "#9D755D", "#BAB0AC", "#ECA82C",
+        "#FF9DA6", "#9D755D", "#BAB0AC", "#ECA82C", "#5F9ED1",
     )
     for name, color in zip(REWARD_COMPONENTS, colors):
         values = np.asarray([float(row[f"reward_component_{name}"]) for row in rows], dtype=np.float64)
@@ -399,6 +452,14 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
                 driving_state, energy_state = split_agent_observations(obs, vehicle_cfg)
                 driving_action = agent.driving.select_action(driving_state, deterministic=True)
                 energy_action = agent.energy.select_action(energy_state, deterministic=True)
+                physical_action = map_split_actions(
+                    driving_action, energy_action, env.action_space
+                )
+            elif isinstance(agent, HASAC):
+                driving_state, energy_state = split_agent_observations(obs, vehicle_cfg)
+                driving_action, energy_action = agent.select_actions(
+                    driving_state, energy_state, deterministic=True
+                )
                 physical_action = map_split_actions(
                     driving_action, energy_action, env.action_space
                 )
@@ -447,7 +508,7 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Train SAC or TD3 on the SUMO FCHEV environment")
     parser.add_argument("--config", default="config/default.json")
-    parser.add_argument("--algorithm", choices=["sac", "td3"], default=None)
+    parser.add_argument("--algorithm", choices=["sac", "hasac", "td3"], default=None)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--gamma", type=float, default=None,
                         help="Override the SAC/TD3 discount factor for this run")
@@ -505,7 +566,10 @@ def main(argv=None):
     # ablation/evaluation runs from overwriting one another's generated scenario.
     cfg["sumo"]["scenario_output_dir"] = str(run_dir / "scenario")
     cfg["training"]["agent_topology"] = (
-        "independent_driving_and_energy_sac" if algorithm_name == "sac" else "single_agent"
+        "hasac_shared_reward_centralized_critic_decentralized_actors"
+        if algorithm_name == "hasac" else
+        "independent_driving_and_energy_sac" if algorithm_name == "sac" else
+        "single_agent"
     )
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
@@ -516,7 +580,14 @@ def main(argv=None):
             "final_checkpoint": "final_episode_<episode_count>.pt",
             "rolling_recovery_checkpoint": "final.pt",
             "checkpoint_contents": "full agent and optimizer state",
-            "sac_agents": ["driving", "energy_management"] if algorithm_name == "sac" else ["joint"],
+            "agents": (
+                ["driving", "energy_management"]
+                if algorithm_name in ("sac", "hasac") else ["joint"]
+            ),
+            "hasac_critic": "centralized twin soft Q over joint state and actions"
+            if algorithm_name == "hasac" else None,
+            "hasac_reward": "same shared reward for both agents: driving_reward + energy_reward"
+            if algorithm_name == "hasac" else None,
         }, f, indent=2)
     top_reward_checkpoints = []
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
@@ -560,7 +631,7 @@ def main(argv=None):
             # signals and the lead-vehicle stop plan use the same scene seed.
             obs, reset_info = env.reset(seed=seed)
             state = normalize_observation(obs, cfg["vehicle"])
-            if isinstance(agent, TwoAgentSAC):
+            if is_dual_policy_agent(agent):
                 driving_state, energy_state = split_agent_observations(obs, cfg["vehicle"])
             total_return = 0.0
             total_driving_return = 0.0
@@ -582,7 +653,7 @@ def main(argv=None):
             local_step = 0
             while True:
                 energy_observed_acceleration = (
-                    float(energy_state[0]) if isinstance(agent, TwoAgentSAC) else None
+                    float(energy_state[0]) if is_dual_policy_agent(agent) else None
                 )
                 if isinstance(agent, TwoAgentSAC):
                     if global_step < learning_starts:
@@ -594,6 +665,20 @@ def main(argv=None):
                         )
                         energy_action_unit = agent.energy.select_action(
                             energy_state, deterministic=False
+                        )
+                    action_unit = np.asarray(
+                        [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
+                    )
+                    physical_action = map_split_actions(
+                        driving_action_unit, energy_action_unit, env.action_space
+                    )
+                elif isinstance(agent, HASAC):
+                    if global_step < learning_starts:
+                        driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                        energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                    else:
+                        driving_action_unit, energy_action_unit = agent.select_actions(
+                            driving_state, energy_state, deterministic=False
                         )
                     action_unit = np.asarray(
                         [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
@@ -613,7 +698,7 @@ def main(argv=None):
                 next_obs, reward, terminated, truncated, info = env.step(physical_action)
                 next_state = normalize_observation(next_obs, cfg["vehicle"])
                 done = terminated or truncated
-                if isinstance(agent, TwoAgentSAC):
+                if is_dual_policy_agent(agent):
                     next_driving_state, next_energy_state = split_agent_observations(
                         next_obs, cfg["vehicle"]
                     )
@@ -625,14 +710,23 @@ def main(argv=None):
                         raise RuntimeError(
                             "Driving and energy rewards do not sum to the environment reward"
                         )
-                    agent.driving.replay.add(
-                        driving_state, driving_action_unit,
-                        driving_reward, next_driving_state, done,
-                    )
-                    agent.energy.replay.add(
-                        energy_state, energy_action_unit,
-                        energy_reward, next_energy_state, done,
-                    )
+                    if isinstance(agent, HASAC):
+                        agent.store_transition(
+                            driving_state, energy_state,
+                            driving_action_unit, energy_action_unit,
+                            driving_reward, energy_reward,
+                            next_driving_state, next_energy_state, done,
+                            expected_team_reward=reward,
+                        )
+                    else:
+                        agent.driving.replay.add(
+                            driving_state, driving_action_unit,
+                            driving_reward, next_driving_state, done,
+                        )
+                        agent.energy.replay.add(
+                            energy_state, energy_action_unit,
+                            energy_reward, next_energy_state, done,
+                        )
                     driving_state, energy_state = next_driving_state, next_energy_state
                     total_driving_return += driving_reward
                     total_energy_return += energy_reward
@@ -666,8 +760,8 @@ def main(argv=None):
                     )
                 trace.append({
                     "time_s": info.get("sumo_time_s"), "reward": reward,
-                    "driving_agent_reward": driving_reward if isinstance(agent, TwoAgentSAC) else None,
-                    "energy_agent_reward": energy_reward if isinstance(agent, TwoAgentSAC) else None,
+                    "driving_agent_reward": driving_reward if is_dual_policy_agent(agent) else None,
+                    "energy_agent_reward": energy_reward if is_dual_policy_agent(agent) else None,
                     "energy_agent_observed_executed_acceleration_m_s2": energy_observed_acceleration,
                     "soc": info.get("battery_soc"), "battery_soh": info.get("battery_soh"),
                     "fcs_soh": info.get("fcs_soh"), "edu_soh": info.get("edu_soh"),
@@ -719,6 +813,10 @@ def main(argv=None):
                     "ego_in_intersection_speed_zone": info.get("ego_in_intersection_speed_zone"),
                     "lead_in_intersection_speed_zone": info.get("lead_in_intersection_speed_zone"),
                     "intersection_speed_limit_m_s": info.get("intersection_speed_limit_m_s"),
+                    "active_speed_limit_m_s": info.get("active_speed_limit_m_s"),
+                    "speeding_delta_v_m_s": info.get("speeding_delta_v_m_s"),
+                    "speeding_penalty_beta": info.get("speeding_penalty_beta"),
+                    "speeding_penalty": info.get("speeding_penalty"),
                     "traffic_light_crossing": info.get("traffic_light_crossing"),
                     "traffic_light_crossed_id": info.get("traffic_light_crossed_id"),
                     "traffic_lights_passed": info.get("traffic_lights_passed"),
@@ -728,6 +826,12 @@ def main(argv=None):
                     "traffic_light_state": info.get("traffic_light_state_observation"),
                     "traffic_light_distance_m": info.get("traffic_light_distance_m"),
                     "traffic_light_remaining_s": info.get("traffic_light_remaining_s"),
+                    "time_to_traffic_light_s": info.get("time_to_traffic_light_s"),
+                    "traffic_light_reward_active": info.get("traffic_light_reward_active"),
+                    "traffic_light_reward": info.get("traffic_light_reward"),
+                    "traffic_light_reward_contribution": info.get(
+                        "traffic_light_reward_contribution"
+                    ),
                     "current_speed_limit_m_s": info.get("current_speed_limit_m_s"),
                     "next_speed_limit_m_s": info.get("next_speed_limit_m_s"),
                     "distance_to_next_speed_region_m": info.get("distance_to_next_speed_region_m"),
@@ -760,6 +864,7 @@ def main(argv=None):
                     "reward_edu_clr_increment": reward_parts.get("edu_clr_increment"),
                     "reward_comfort": reward_parts.get("comfort"),
                     "reward_following": reward_parts.get("following"),
+                    "reward_speeding": reward_parts.get("speeding"),
                     "reward_soc_penalty": reward_parts.get("soc_penalty"),
                     "zero_speed_negative_accel_penalty": reward_parts.get(
                         "zero_speed_negative_accel_penalty"
@@ -793,8 +898,8 @@ def main(argv=None):
             row = {
                 "episode": episode, "seed": seed,
                 "return": total_return, "penalty_magnitude": -total_return,
-                "driving_agent_return": total_driving_return if isinstance(agent, TwoAgentSAC) else None,
-                "energy_agent_return": total_energy_return if isinstance(agent, TwoAgentSAC) else None,
+                "driving_agent_return": total_driving_return if is_dual_policy_agent(agent) else None,
+                "energy_agent_return": total_energy_return if is_dual_policy_agent(agent) else None,
                 "steps": local_step,
                 "hydrogen_g": total_hydrogen, "collisions": collisions,
                 "collision_events": collision_events,
@@ -825,7 +930,10 @@ def main(argv=None):
             row.update({f"reward_component_{name}": value for name, value in reward_component_totals.items()})
             row["reward_component_total"] = sum(reward_component_totals.values())
             _append_csv(run_dir / "episodes.csv", [row], list(row))
-            loss_fields = ["agent", "global_step", "critic_loss", "actor_loss", "alpha_loss", "alpha"]
+            loss_fields = [
+                "agent", "global_step", "critic_loss", "actor_loss",
+                "driving_actor_loss", "energy_actor_loss", "alpha_loss", "alpha",
+            ]
             if updates:
                 _append_csv(run_dir / "losses.csv", updates, loss_fields)
             if total_return > best_return:
@@ -849,7 +957,7 @@ def main(argv=None):
                 + (
                     f", driving_return={total_driving_return:.3f}, "
                     f"energy_return={total_energy_return:.3f}"
-                    if isinstance(agent, TwoAgentSAC) else ""
+                    if is_dual_policy_agent(agent) else ""
                 )
             )
             if episode % int(tr.get("evaluation_interval_episodes", 10)) == 0 and tr.get("evaluation_episodes", 0) > 0:
@@ -865,6 +973,19 @@ def main(argv=None):
             plot_interval = max(1, int(tr.get("plot_interval_episodes", 10)))
             if episode % plot_interval == 0 or episode == episodes:
                 _plot_episode_rewards(run_dir / "episodes.csv", run_dir / "episode_reward.png")
+                if is_dual_policy_agent(agent):
+                    _plot_agent_episode_rewards(
+                        run_dir / "episodes.csv",
+                        run_dir / "driving_agent_episode_reward.png",
+                        "driving_agent_return",
+                        "Driving agent",
+                    )
+                    _plot_agent_episode_rewards(
+                        run_dir / "episodes.csv",
+                        run_dir / "energy_agent_episode_reward.png",
+                        "energy_agent_return",
+                        "Energy agent",
+                    )
                 _plot_episode_metrics(run_dir / "episodes.csv", run_dir / "episode_metrics.png")
                 _plot_reward_components(run_dir / "episodes.csv", run_dir / "reward_components.png")
                 print(f"Updated reward and metrics plots through episode {episode}.")
@@ -875,6 +996,19 @@ def main(argv=None):
     elapsed = time.perf_counter() - start_time
     reward_plot = run_dir / "episode_reward.png"
     _plot_episode_rewards(run_dir / "episodes.csv", reward_plot)
+    driving_reward_plot = None
+    energy_reward_plot = None
+    if is_dual_policy_agent(agent):
+        driving_reward_plot = run_dir / "driving_agent_episode_reward.png"
+        energy_reward_plot = run_dir / "energy_agent_episode_reward.png"
+        _plot_agent_episode_rewards(
+            run_dir / "episodes.csv", driving_reward_plot,
+            "driving_agent_return", "Driving agent",
+        )
+        _plot_agent_episode_rewards(
+            run_dir / "episodes.csv", energy_reward_plot,
+            "energy_agent_return", "Energy agent",
+        )
     metrics_plot = run_dir / "episode_metrics.png"
     _plot_episode_metrics(run_dir / "episodes.csv", metrics_plot)
     components_plot = run_dir / "reward_components.png"
@@ -897,12 +1031,19 @@ def main(argv=None):
             if isinstance(agent, TwoAgentSAC) else str(agent.replay.device)
         ),
         "agent_topology": (
+            "hasac_shared_reward_centralized_critic_decentralized_actors"
+            if isinstance(agent, HASAC) else
             "independent_driving_and_energy_sac"
             if isinstance(agent, TwoAgentSAC) else "single_agent"
         ),
         "agent_observation_dimensions": (
             {"driving": 11, "energy": 5}
-            if isinstance(agent, TwoAgentSAC) else {"joint": env.observation_space.shape[0]}
+            if is_dual_policy_agent(agent) else {"joint": env.observation_space.shape[0]}
+        ),
+        "hasac_entropy_temperature": agent.alpha if isinstance(agent, HASAC) else None,
+        "hasac_shared_reward_definition": (
+            "driving_reward + energy_reward; identical cooperative reward for both actors"
+            if isinstance(agent, HASAC) else None
         ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)
@@ -910,6 +1051,12 @@ def main(argv=None):
         ),
         "run_directory": str(run_dir),
         "episode_reward_plot": str(reward_plot),
+        "driving_agent_episode_reward_plot": (
+            str(driving_reward_plot) if driving_reward_plot is not None else None
+        ),
+        "energy_agent_episode_reward_plot": (
+            str(energy_reward_plot) if energy_reward_plot is not None else None
+        ),
         "episode_metrics_plot": str(metrics_plot),
         "reward_components_plot": str(components_plot),
         "termination_reason_counts": dict(termination_counts),
@@ -928,6 +1075,9 @@ def main(argv=None):
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(f"Saved episode reward curve to {reward_plot}")
+    if driving_reward_plot is not None:
+        print(f"Saved driving-agent reward curve to {driving_reward_plot}")
+        print(f"Saved energy-agent reward curve to {energy_reward_plot}")
     print(f"Saved episode state metrics to {metrics_plot}")
     print(f"Saved reward component curves to {components_plot}")
     print(json.dumps(summary, indent=2))

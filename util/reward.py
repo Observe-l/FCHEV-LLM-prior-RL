@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+
 
 def safety_distance(speed_m_s: float):
     v = max(0.0, float(speed_m_s))
@@ -7,6 +9,14 @@ def safety_distance(speed_m_s: float):
     dmin = 2.0 + 0.5 * v + 0.0625 * v * v
     dmax = 10.0 + v + 0.0825 * v * v
     return dmin, dmax
+
+
+def speeding_reward(speed_m_s: float, speed_limit_m_s: float, beta: float = 1.0):
+    """Return a linear overspeed penalty and excess speed, both in SI units."""
+    speed = max(0.0, float(speed_m_s))
+    speed_limit = max(0.0, float(speed_limit_m_s))
+    delta_v = max(0.0, speed - speed_limit)
+    return -float(beta) * delta_v, delta_v
 
 
 def following_reward(speed_m_s: float, gap_m: float, d_ref_m: float,
@@ -27,6 +37,35 @@ def following_reward(speed_m_s: float, gap_m: float, d_ref_m: float,
         return float(c0) - float(c2) * (d - d_max) / (d_ref - d_max)
     delta_d = float(previous_gap_m) - d
     return float(c3) * delta_d
+
+
+def traffic_light_reward(speed_m_s: float, distance_m: float, signal_state,
+                         phase_remaining_s: float,
+                         c_green: float = 10.0, c_non_green: float = 10.0):
+    """Reward a predicted green arrival and penalize predicted yellow/red arrival.
+
+    Arrival time is estimated as distance / current speed. No reward is active
+    while stopped, when no signal is observable, or when the current phase is
+    predicted to change before arrival.
+    """
+    speed = max(0.0, float(speed_m_s))
+    distance = max(0.0, float(distance_m))
+    remaining = max(0.0, float(phase_remaining_s))
+    if speed <= 1e-9 or not np.isfinite(distance) or not np.isfinite(remaining):
+        return 0.0, float("inf"), False
+
+    arrival_time = distance / speed
+    if not arrival_time < remaining:
+        return 0.0, arrival_time, False
+
+    if isinstance(signal_state, str):
+        state = signal_state.strip().lower()[:1]
+        green = state in ("g",)
+    else:
+        state_value = float(signal_state)
+        green = np.isclose(state_value, 1.0)
+    value = float(c_green) if green else -float(c_non_green)
+    return value, arrival_time, True
 
 
 def compute_reward(components: dict, cfg: dict):

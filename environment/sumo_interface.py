@@ -242,7 +242,7 @@ class SumoInterface:
         self.traci.vehicle.setMaxSpeed(
             "lead",
             float(self.cfg.get("intersection_speed_limit_kph", 30.0)) / 3.6
-            if should_limit else float(self.vehicle_cfg.get("max_speed_mps", 19.1666666667)),
+            if should_limit else float(self.vehicle_cfg.get("max_speed_mps", 19.4444444444)),
         )
         self._lead_speed_limit_active = should_limit
 

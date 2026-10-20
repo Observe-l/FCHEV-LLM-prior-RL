@@ -18,7 +18,10 @@ from util.battery_model import BatteryModel
 from util.data import ProjectData
 from util.edu_model import EDUModel
 from util.fcs_model import FCSModel
-from util.reward import compute_reward, following_reward, safety_distance
+from util.reward import (
+    compute_reward, following_reward, safety_distance, speeding_reward,
+    traffic_light_reward,
+)
 from util.vehicle_dynamics import longitudinal_demand
 
 
@@ -425,14 +428,22 @@ class FCHEVEnv(gym.Env):
             next_observation = self._observation(states_before)
             self._last_state = states_before
             terminal_penalty = float(
-                self.config["reward"].get(
-                    "abnormal_termination_penalty",
-                    self.config["reward"].get(
-                        "collision_red_light_terminal_penalty", -500.0
-                    ),
-                )
+                self.config["reward"].get("abnormal_termination_penalty", -50.0)
+            )
+            speed_penalty_beta = float(
+                self.config["reward"].get("speeding_penalty_beta", 1.0)
             )
             self._last_reward_components = {
+                "speeding": 0.0,
+                "speeding_delta_v_m_s": 0.0,
+                "speeding_penalty_beta": speed_penalty_beta,
+                "beta_speeding": speed_penalty_beta,
+                "reward_contribution_speeding": 0.0,
+                "traffic_light": 0.0,
+                "beta_traffic_light": float(
+                    self.config["reward"]["reward_coefficients"].get("beta_7", 1.0)
+                ),
+                "reward_contribution_traffic_light": 0.0,
                 "terminal_penalty": terminal_penalty,
                 "reward_contribution_terminal_penalty": terminal_penalty,
             }
@@ -447,6 +458,9 @@ class FCHEVEnv(gym.Env):
                 "max_speed_m_s": max_speed,
                 "requested_next_speed_m_s": requested_next_speed,
                 "max_speed_action_violation": True,
+                "speeding_delta_v_m_s": 0.0,
+                "speeding_penalty_beta": speed_penalty_beta,
+                "speeding_penalty": 0.0,
                 "speed_limit_clip": False,
                 "physical_powertrain_clip": False,
                 "no_reverse_clip": False,
@@ -483,6 +497,26 @@ class FCHEVEnv(gym.Env):
             return next_observation, terminal_penalty, True, False, info
 
         tls = states_before.get("next_tls")
+        light_reward_cfg = self.config["reward"]
+        beta_traffic_light = float(
+            light_reward_cfg["reward_coefficients"].get("beta_7", 1.0)
+        )
+        if tls is None:
+            traffic_light_reward_raw, time_to_light_s, traffic_light_reward_active = (
+                0.0, float("inf"), False
+            )
+        else:
+            traffic_light_reward_raw, time_to_light_s, traffic_light_reward_active = (
+                traffic_light_reward(
+                    ego0["speed_m_s"], tls.get("distance_m", float("inf")),
+                    tls.get("state", ""), tls.get("remaining_s", 0.0),
+                    light_reward_cfg.get("traffic_light_c1_green", 10.0),
+                    light_reward_cfg.get("traffic_light_c2_non_green", 10.0),
+                )
+            )
+        traffic_light_reward_contribution = (
+            beta_traffic_light * traffic_light_reward_raw
+        )
         lead_tls_before = states_before.get("lead_next_tls")
         lead0 = states_before.get("lead")
         # Battery limits depend on the current SOC, RC polarization, and
@@ -536,9 +570,15 @@ class FCHEVEnv(gym.Env):
         if lead_new_tls_crossing:
             self._lead_passed_tls_ids.add(lead_crossed_tls_id)
 
-        speed_limit_m_s = float(
+        intersection_speed_limit_m_s = float(
             self.sumo_cfg.get("intersection_speed_limit_kph", 30.0)
         ) / 3.6
+        speeding_tolerance = float(
+            self.config["reward"].get("speeding_termination_fraction", 0.20)
+        )
+        speed_penalty_beta = float(
+            self.config["reward"].get("speeding_penalty_beta", 1.0)
+        )
         speed_zone_m = float(self.sumo_cfg.get("intersection_speed_zone_m", 100.0))
         ego_speed_zone = (
             self._inside_intersection_speed_zone(ego0, tls, speed_zone_m)
@@ -555,13 +595,24 @@ class FCHEVEnv(gym.Env):
         speeding_vehicles = []
         if ego_speed_zone and max(
             float(ego0["speed_m_s"]), float(ego1["speed_m_s"])
-        ) > speed_limit_m_s + 1e-3:
+        ) >= intersection_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
             speeding_vehicles.append("ego")
         if lead_speed_zone and lead0 is not None and lead1 is not None and max(
             float(lead0["speed_m_s"]), float(lead1["speed_m_s"])
-        ) > speed_limit_m_s + 1e-3:
+        ) >= intersection_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
             speeding_vehicles.append("lead")
         speeding_violation = bool(speeding_vehicles)
+        # The active area's limit is 30 km/h in the intersection zone and the
+        # vehicle's configured cap on ordinary road. A red-light stop target
+        # is separate and must not be treated as a 0 m/s limit throughout the
+        # approach.
+        active_speed_limit_m_s = (
+            intersection_speed_limit_m_s
+            if ego_speed_zone else float(self.vehicle_cfg["max_speed_mps"])
+        )
+        speeding_penalty, speeding_delta_v_m_s = speeding_reward(
+            ego1["speed_m_s"], active_speed_limit_m_s, speed_penalty_beta
+        )
         actual_accel = (ego1["speed_m_s"] - ego0["speed_m_s"]) / self.dt
         actual_plan = self._candidate(
             ego0["speed_m_s"], actual_accel, requested_fcs, battery_limits
@@ -614,6 +665,11 @@ class FCHEVEnv(gym.Env):
             "edu_clr_increment": edu_deg.increment,
             "comfort": abs(actual_accel - self._last_accel)
             / max(self.vehicle_cfg["max_action_acceleration_m_s2"] - self.vehicle_cfg["min_action_acceleration_m_s2"], 1e-9),
+            "speeding": speeding_penalty,
+            "speeding_delta_v_m_s": speeding_delta_v_m_s,
+            "speeding_penalty_beta": speed_penalty_beta,
+            "beta_speeding": speed_penalty_beta,
+            "reward_contribution_speeding": speeding_penalty,
             "following": following_reward(
                 ego1["speed_m_s"], gap,
                 self.config["reward"]["following_d_ref_m"],
@@ -629,11 +685,16 @@ class FCHEVEnv(gym.Env):
             "soc_penalty": abs(self.battery.state.soc - self.config["reward"]["target_soc"]),
         }
         reward = compute_reward(reward_parts, self.config["reward"])
+        reward += speeding_penalty
+        reward_parts["traffic_light"] = traffic_light_reward_raw
+        reward_parts["beta_traffic_light"] = beta_traffic_light
+        reward_parts["reward_contribution_traffic_light"] = (
+            traffic_light_reward_contribution
+        )
+        reward_parts["time_to_traffic_light_s"] = time_to_light_s
+        reward_parts["traffic_light_reward_active"] = traffic_light_reward_active
+        reward += traffic_light_reward_contribution
         zero_speed_negative_accel_penalty = 0.0
-        if ego0["speed_m_s"] <= 1e-6 and requested_accel < -1e-9:
-            zero_speed_negative_accel_penalty = float(
-                self.config["reward"].get("zero_speed_negative_accel_penalty", -10.0)
-            )
         reward_parts["zero_speed_negative_accel_penalty"] = (
             zero_speed_negative_accel_penalty
         )
@@ -694,18 +755,15 @@ class FCHEVEnv(gym.Env):
 
         terminated = termination_reason is not None
         truncated = not terminated and self._step_count >= int(self.sumo_cfg["episode_limit_s"])
-        terminal_penalty = 0.0
-        if termination_reason in (
-            "collision", "red_light_violation", "speeding", "max_speed_action"
-        ):
-            terminal_penalty = float(
-                self.config["reward"].get(
-                    "abnormal_termination_penalty",
-                    self.config["reward"].get(
-                        "collision_red_light_terminal_penalty", -500.0
-                    ),
-                )
-            )
+        terminal_penalty = (
+            float(self.config["reward"].get("abnormal_termination_penalty", -50.0))
+            if termination_reason in {
+                "collision", "red_light_violation", "speeding"
+            }
+            else 0.0
+        )
+        if collision_event:
+            collision_penalty = terminal_penalty
         reward_parts["terminal_penalty"] = terminal_penalty
         reward_parts["reward_contribution_terminal_penalty"] = terminal_penalty
         reward += terminal_penalty
@@ -773,7 +831,8 @@ class FCHEVEnv(gym.Env):
             "red_light_violation": red_light_violation,
             "speeding_violation": speeding_violation,
             "speeding_vehicles": speeding_vehicles,
-            "intersection_speed_limit_m_s": speed_limit_m_s,
+            "intersection_speed_limit_m_s": intersection_speed_limit_m_s,
+            "active_speed_limit_m_s": active_speed_limit_m_s,
             "ego_in_intersection_speed_zone": ego_speed_zone,
             "lead_in_intersection_speed_zone": lead_speed_zone,
             "gap_overlap": gap_overlap,
@@ -785,6 +844,9 @@ class FCHEVEnv(gym.Env):
             "abnormal_termination": abnormal_termination,
             "terminal_penalty": terminal_penalty,
             "collision_penalty": collision_penalty,
+            "speeding_penalty": speeding_penalty,
+            "speeding_delta_v_m_s": speeding_delta_v_m_s,
+            "speeding_penalty_beta": speed_penalty_beta,
             "speed_limit_positive_accel_penalty": speed_limit_positive_accel_penalty,
             "zero_speed_negative_accel_penalty": zero_speed_negative_accel_penalty,
             "safety_violations": int(safety_violation),
@@ -800,6 +862,10 @@ class FCHEVEnv(gym.Env):
             "traffic_light_state_observation": float(next_observation[9]),
             "traffic_light_distance_m": float(next_observation[10]),
             "traffic_light_remaining_s": float(next_observation[11]),
+            "time_to_traffic_light_s": time_to_light_s,
+            "traffic_light_reward_active": traffic_light_reward_active,
+            "traffic_light_reward": traffic_light_reward_raw,
+            "traffic_light_reward_contribution": traffic_light_reward_contribution,
             "current_speed_limit_m_s": float(next_observation[12]),
             "next_speed_limit_m_s": float(next_observation[13]),
             "distance_to_next_speed_region_m": float(next_observation[14]),
