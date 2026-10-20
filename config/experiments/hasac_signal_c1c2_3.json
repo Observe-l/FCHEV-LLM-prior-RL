@@ -13,6 +13,7 @@
     "signal_yellow_s": 3,
     "signal_red_s": 47,
     "intersection_speed_limit_kph": 30.0,
+    "road_speed_limit_kph": 70.0,
     "intersection_speed_zone_m": 100.0,
     "intersection_speed_approach_m": 200.0,
     "lead_stop_duration_range_s": [
@@ -28,7 +29,7 @@
     "ego_depart_speed_mps": 0.0,
     "lead_depart_speed_mps": 0.0,
     "lead_target_speed_mps": 13.0,
-    "max_speed_mps": 19.1666666667,
+    "max_speed_mps": 23.333333333333332,
     "gui": false,
     "collision_action": "warn"
   },
@@ -43,7 +44,7 @@
     "air_density_kg_m3": 1.225,
     "gravity_m_s2": 9.8,
     "road_slope_deg": 0.0,
-    "max_speed_mps": 19.1666666667,
+    "max_speed_mps": 23.333333333333332,
     "min_action_acceleration_m_s2": -1.5,
     "max_action_acceleration_m_s2": 0.7,
     "emergency_deceleration_m_s2": 6.68,

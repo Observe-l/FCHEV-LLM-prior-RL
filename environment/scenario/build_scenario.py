@@ -110,11 +110,12 @@ def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict,
     ET.ElementTree(nodes).write(node_file, encoding="utf-8", xml_declaration=True)
 
     edges = ET.Element("edges")
-    max_speed = float(vehicle_cfg["max_speed_mps"])
+    road_speed_limit = float(sumo_cfg.get("road_speed_limit_kph", 70.0)) / 3.6
+    vehicle_max_speed = float(vehicle_cfg["max_speed_mps"])
     for i in range(n_tls + 2):
         ET.SubElement(edges, "edge", {
             "id": f"e{i}", "from": f"n{i}", "to": f"n{i + 1}",
-            "numLanes": "1", "speed": f"{max_speed:.6f}",
+            "numLanes": "1", "speed": f"{road_speed_limit:.6f}",
             "priority": "1", "spreadType": "center",
         })
     ET.ElementTree(edges).write(edge_file, encoding="utf-8", xml_declaration=True)
@@ -155,10 +156,10 @@ def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict,
         "carFollowModel": "IDM", "speedFactor": "1.0",
     }
     lead_attrs = dict(
-        common, id="leadType", maxSpeed=f"{max_speed:.6f}",
-        speedFactor=f"{sumo_cfg['lead_target_speed_mps'] / max_speed:.8f}",
+        common, id="leadType", maxSpeed=f"{vehicle_max_speed:.6f}",
+        speedFactor=f"{sumo_cfg['lead_target_speed_mps'] / road_speed_limit:.8f}",
     )
-    ego_attrs = dict(common, id="egoType", maxSpeed=f"{max_speed:.6f}")
+    ego_attrs = dict(common, id="egoType", maxSpeed=f"{vehicle_max_speed:.6f}")
     ET.SubElement(routes, "vType", lead_attrs)
     ET.SubElement(routes, "vType", ego_attrs)
     ego_route_id = "egoRoute"

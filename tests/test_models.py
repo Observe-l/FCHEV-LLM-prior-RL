@@ -258,12 +258,13 @@ class DataAndPlantTests(unittest.TestCase):
         self.assertGreater(demand.traction_force_n, 0)
         self.assertGreater(demand.motor_speed_rpm, 0)
         self.assertGreater(demand.motor_torque_nm, 0)
+        road_speed_limit_mps = self.cfg["sumo"]["road_speed_limit_kph"] / 3.6
         at_limit = longitudinal_demand(
-            self.cfg["vehicle"]["max_speed_mps"] - 0.1, 0.7, 1.0, self.cfg["vehicle"]
+            road_speed_limit_mps - 0.1, 0.7, 1.0, self.cfg["vehicle"]
         )
         self.assertAlmostEqual(
             at_limit.next_speed_m_s,
-            self.cfg["vehicle"]["max_speed_mps"] + 0.6,
+            road_speed_limit_mps + 0.6,
         )
         self.assertAlmostEqual(at_limit.executed_acceleration_m_s2, 0.7, places=8)
         point = EDUModel(self.data.motor).lookup(at_limit.motor_speed_rpm, at_limit.motor_torque_nm)
@@ -553,12 +554,16 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(float(obs[8]), 10.0, places=5)
             self.assertAlmostEqual(float(obs[5]), 0.0, places=6)
             self.assertAlmostEqual(float(obs[7]), 0.0, places=6)
+            self.assertAlmostEqual(
+                env.vehicle_cfg["max_speed_mps"], 84.0 / 3.6, places=8
+            )
+            self.assertAlmostEqual(env._road_speed_limit_m_s(), 70.0 / 3.6)
             self.assertIn(float(obs[9]), (0.0, 1.0, 2.0))
             self.assertGreater(float(obs[10]), 900.0)
             self.assertGreaterEqual(float(obs[11]), 0.0)
             self.assertLessEqual(float(obs[11]), 100.0)
             self.assertAlmostEqual(
-                float(obs[12]), env.vehicle_cfg["max_speed_mps"], places=5
+                float(obs[12]), env._road_speed_limit_m_s(), places=5
             )
             if float(obs[9]) == 0.0:
                 self.assertEqual(float(obs[13]), 0.0)
@@ -579,6 +584,15 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(reset_info["gap_monitor_threshold_m"], 1000.0)
             route_root = env.scenario_cfg.parent / "vehicles.rou.xml"
             route_text = route_root.read_text(encoding="utf-8")
+            edge_root = ET.parse(env.scenario_cfg.parent / "road.edg.xml").getroot()
+            self.assertAlmostEqual(
+                float(edge_root.find("edge").attrib["speed"]), 70.0 / 3.6, places=5
+            )
+            route_xml = ET.parse(route_root).getroot()
+            self.assertAlmostEqual(
+                float(route_xml.find("vType").attrib["maxSpeed"]),
+                84.0 / 3.6, places=5,
+            )
             self.assertIn('id="lead"', route_text)
             self.assertEqual(route_text.count('departSpeed="0.000"'), 2)
             self.assertIn('id="ego" type="egoType" route="egoRoute"', route_text)
@@ -878,7 +892,7 @@ class SumoIntegrationTests(unittest.TestCase):
                 {"lane_id": "e0_0"},
                 tls,
             )
-            self.assertAlmostEqual(current, env.vehicle_cfg["max_speed_mps"])
+            self.assertAlmostEqual(current, 70.0 / 3.6)
             self.assertAlmostEqual(
                 upcoming, env.sumo_cfg["intersection_speed_limit_kph"] / 3.6
             )
@@ -977,6 +991,69 @@ class SumoIntegrationTests(unittest.TestCase):
                 sum(v for k, v in info["reward_components"].items()
                     if k.startswith("reward_contribution_")),
             )
+        finally:
+            env.close()
+
+    def test_ordinary_road_speeding_between_70_and_84_kph_is_penalized_not_terminated(self):
+        env = FCHEVEnv(project_root=ROOT)
+        try:
+            env.reset(seed=144)
+            env.sumo.traci.vehicle.moveTo("lead", "e0_0", 500.0)
+            original_states = env.sumo.states
+
+            def report_ordinary_road_speed(force_fresh=False):
+                states = original_states(force_fresh=force_fresh)
+                states["ego"] = dict(states["ego"])
+                states["ego"]["speed_m_s"] = 75.0 / 3.6
+                states["next_tls"] = {
+                    "id": "n1", "link_index": 0, "distance_m": 500.0,
+                    "state": "G", "remaining_s": 20.0,
+                }
+                return states
+
+            env.sumo.states = report_ordinary_road_speed
+            # Positive acceleration from 75 km/h must not hit the old 70 km/h
+            # hard action guard; it remains below the 84 km/h threshold.
+            _, _, terminated, truncated, info = env.step(np.asarray([0.7, 0.0]))
+            env.sumo.states = original_states
+            self.assertFalse(terminated)
+            self.assertFalse(truncated)
+            self.assertIsNone(info["terminated_reason"])
+            self.assertFalse(info["speeding_violation"])
+            self.assertAlmostEqual(info["active_speed_limit_m_s"], 70.0 / 3.6)
+            self.assertAlmostEqual(info["speeding_delta_v_m_s"], 5.0 / 3.6)
+            self.assertAlmostEqual(info["speeding_penalty"], -(5.0 / 3.6))
+        finally:
+            env.close()
+
+    def test_ordinary_road_speeding_terminates_at_84_kph_with_penalties(self):
+        env = FCHEVEnv(project_root=ROOT)
+        try:
+            env.reset(seed=145)
+            env.sumo.traci.vehicle.moveTo("lead", "e0_0", 500.0)
+            original_states = env.sumo.states
+
+            def report_ordinary_road_speed(force_fresh=False):
+                states = original_states(force_fresh=force_fresh)
+                states["ego"] = dict(states["ego"])
+                states["ego"]["speed_m_s"] = 84.0 / 3.6
+                states["next_tls"] = {
+                    "id": "n1", "link_index": 0, "distance_m": 500.0,
+                    "state": "G", "remaining_s": 20.0,
+                }
+                return states
+
+            env.sumo.states = report_ordinary_road_speed
+            _, _, terminated, truncated, info = env.step(np.asarray([0.0, 0.0]))
+            env.sumo.states = original_states
+            self.assertTrue(terminated)
+            self.assertFalse(truncated)
+            self.assertEqual(info["terminated_reason"], "speeding")
+            self.assertTrue(info["speeding_violation"])
+            self.assertAlmostEqual(info["active_speed_limit_m_s"], 70.0 / 3.6)
+            self.assertAlmostEqual(info["speeding_delta_v_m_s"], 14.0 / 3.6)
+            self.assertAlmostEqual(info["speeding_penalty"], -(14.0 / 3.6))
+            self.assertEqual(info["terminal_penalty"], -50.0)
         finally:
             env.close()
 

@@ -76,7 +76,7 @@ class FCHEVEnv(gym.Env):
             high=np.asarray([
                 0.90, 1, 1, 1, 0.7, self.vehicle_cfg["max_speed_mps"],
                 0.7, self.vehicle_cfg["max_speed_mps"], 30000, 2, 30000, 100,
-                self.vehicle_cfg["max_speed_mps"], self.vehicle_cfg["max_speed_mps"],
+                self._road_speed_limit_m_s(), self._road_speed_limit_m_s(),
                 30000,
             ], dtype=np.float32),
             dtype=np.float32,
@@ -153,6 +153,10 @@ class FCHEVEnv(gym.Env):
             distance_to_next_speed_region,
         ], dtype=np.float32)
 
+    def _road_speed_limit_m_s(self):
+        """Posted speed limit on ordinary road segments, in m/s."""
+        return float(self.sumo_cfg.get("road_speed_limit_kph", 70.0)) / 3.6
+
     def _speed_region_observation(self, states, ego, tls):
         """Return current area cap and the next speed-control point.
 
@@ -161,7 +165,7 @@ class FCHEVEnv(gym.Env):
         speed target at its stop line, not a zero legal speed throughout the
         approach area.
         """
-        road_limit = float(self.vehicle_cfg["max_speed_mps"])
+        road_limit = self._road_speed_limit_m_s()
         intersection_limit = min(
             road_limit,
             float(self.sumo_cfg.get("intersection_speed_limit_kph", 30.0)) / 3.6,
@@ -433,12 +437,27 @@ class FCHEVEnv(gym.Env):
             speed_penalty_beta = float(
                 self.config["reward"].get("speeding_penalty_beta", 1.0)
             )
+            tls_before = states_before.get("next_tls")
+            intersection_limit = float(
+                self.sumo_cfg.get("intersection_speed_limit_kph", 30.0)
+            ) / 3.6
+            active_limit = (
+                intersection_limit
+                if self._inside_intersection_speed_zone(
+                    ego0, tls_before,
+                    float(self.sumo_cfg.get("intersection_speed_zone_m", 100.0)),
+                )
+                else self._road_speed_limit_m_s()
+            )
+            speeding_penalty, speeding_delta_v_m_s = speeding_reward(
+                requested_next_speed, active_limit, speed_penalty_beta
+            )
             self._last_reward_components = {
-                "speeding": 0.0,
-                "speeding_delta_v_m_s": 0.0,
+                "speeding": speeding_penalty,
+                "speeding_delta_v_m_s": speeding_delta_v_m_s,
                 "speeding_penalty_beta": speed_penalty_beta,
                 "beta_speeding": speed_penalty_beta,
-                "reward_contribution_speeding": 0.0,
+                "reward_contribution_speeding": speeding_penalty,
                 "traffic_light": 0.0,
                 "beta_traffic_light": float(
                     self.config["reward"]["reward_coefficients"].get("beta_7", 1.0)
@@ -447,6 +466,7 @@ class FCHEVEnv(gym.Env):
                 "terminal_penalty": terminal_penalty,
                 "reward_contribution_terminal_penalty": terminal_penalty,
             }
+            total_reward = terminal_penalty + speeding_penalty
             info = {
                 "sumo_time_s": states_before["time_s"],
                 "requested_acceleration_raw_m_s2": float(requested_raw[0]),
@@ -458,9 +478,13 @@ class FCHEVEnv(gym.Env):
                 "max_speed_m_s": max_speed,
                 "requested_next_speed_m_s": requested_next_speed,
                 "max_speed_action_violation": True,
-                "speeding_delta_v_m_s": 0.0,
+                "speeding_delta_v_m_s": speeding_delta_v_m_s,
                 "speeding_penalty_beta": speed_penalty_beta,
-                "speeding_penalty": 0.0,
+                "speeding_penalty": speeding_penalty,
+                "active_speed_limit_m_s": active_limit,
+                "speeding_violation": True,
+                "speeding_vehicles": ["ego"],
+                "speed_limit_m_s": active_limit,
                 "speed_limit_clip": False,
                 "physical_powertrain_clip": False,
                 "no_reverse_clip": False,
@@ -470,8 +494,6 @@ class FCHEVEnv(gym.Env):
                 "collision_event": False,
                 "gap_overlap": False,
                 "red_light_violation": False,
-                "speeding_violation": False,
-                "speeding_vehicles": [],
                 "terminal_penalty": terminal_penalty,
                 "collision_penalty": 0.0,
                 "speed_limit_positive_accel_penalty": 0.0,
@@ -494,7 +516,7 @@ class FCHEVEnv(gym.Env):
                 "distance_to_next_speed_region_m": float(next_observation[14]),
                 "reward_components": dict(self._last_reward_components),
             }
-            return next_observation, terminal_penalty, True, False, info
+            return next_observation, total_reward, True, False, info
 
         tls = states_before.get("next_tls")
         light_reward_cfg = self.config["reward"]
@@ -592,24 +614,29 @@ class FCHEVEnv(gym.Env):
                 lead1, lead_tls_after, speed_zone_m
             )
         )
+        road_speed_limit_m_s = self._road_speed_limit_m_s()
+        ego_active_speed_limit_m_s = (
+            intersection_speed_limit_m_s
+            if ego_speed_zone else road_speed_limit_m_s
+        )
+        lead_active_speed_limit_m_s = (
+            intersection_speed_limit_m_s
+            if lead_speed_zone else road_speed_limit_m_s
+        )
         speeding_vehicles = []
-        if ego_speed_zone and max(
+        if max(
             float(ego0["speed_m_s"]), float(ego1["speed_m_s"])
-        ) >= intersection_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
+        ) >= ego_active_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
             speeding_vehicles.append("ego")
-        if lead_speed_zone and lead0 is not None and lead1 is not None and max(
+        if lead0 is not None and lead1 is not None and max(
             float(lead0["speed_m_s"]), float(lead1["speed_m_s"])
-        ) >= intersection_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
+        ) >= lead_active_speed_limit_m_s * (1.0 + speeding_tolerance) - 1e-6:
             speeding_vehicles.append("lead")
         speeding_violation = bool(speeding_vehicles)
-        # The active area's limit is 30 km/h in the intersection zone and the
-        # vehicle's configured cap on ordinary road. A red-light stop target
-        # is separate and must not be treated as a 0 m/s limit throughout the
-        # approach.
-        active_speed_limit_m_s = (
-            intersection_speed_limit_m_s
-            if ego_speed_zone else float(self.vehicle_cfg["max_speed_mps"])
-        )
+        # Speeding penalties use posted limits (30 km/h in the intersection
+        # zone, 70 km/h on ordinary roads); the vehicle hard cap is separate.
+        # A red-light stop target is not a zero speed limit throughout approach.
+        active_speed_limit_m_s = ego_active_speed_limit_m_s
         speeding_penalty, speeding_delta_v_m_s = speeding_reward(
             ego1["speed_m_s"], active_speed_limit_m_s, speed_penalty_beta
         )

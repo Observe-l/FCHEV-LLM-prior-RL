@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-10-19 20:39:33 by Eclipse SUMO netconvert Version 1.19.0
+<!-- generated on 2026-10-20 15:06:13 by Eclipse SUMO netconvert Version 1.19.0
 <configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netconvertConfiguration.xsd">
 
     <input>
@@ -30,164 +30,164 @@
     <location netOffset="1000.00,0.00" convBoundary="0.00,0.00,27000.00,0.00" origBoundary="-1000.00,0.00,26000.00,0.00" projParameter="!"/>
 
     <edge id=":n1_0" function="internal">
-        <lane id=":n1_0_0" index="0" speed="19.17" length="0.10" shape="1000.00,0.00 1000.00,0.00"/>
+        <lane id=":n1_0_0" index="0" speed="19.44" length="0.10" shape="1000.00,0.00 1000.00,0.00"/>
     </edge>
     <edge id=":n10_0" function="internal">
-        <lane id=":n10_0_0" index="0" speed="19.17" length="0.10" shape="10000.00,0.00 10000.00,0.00"/>
+        <lane id=":n10_0_0" index="0" speed="19.44" length="0.10" shape="10000.00,0.00 10000.00,0.00"/>
     </edge>
     <edge id=":n11_0" function="internal">
-        <lane id=":n11_0_0" index="0" speed="19.17" length="0.10" shape="11000.00,0.00 11000.00,0.00"/>
+        <lane id=":n11_0_0" index="0" speed="19.44" length="0.10" shape="11000.00,0.00 11000.00,0.00"/>
     </edge>
     <edge id=":n12_0" function="internal">
-        <lane id=":n12_0_0" index="0" speed="19.17" length="0.10" shape="12000.00,0.00 12000.00,0.00"/>
+        <lane id=":n12_0_0" index="0" speed="19.44" length="0.10" shape="12000.00,0.00 12000.00,0.00"/>
     </edge>
     <edge id=":n13_0" function="internal">
-        <lane id=":n13_0_0" index="0" speed="19.17" length="0.10" shape="13000.00,0.00 13000.00,0.00"/>
+        <lane id=":n13_0_0" index="0" speed="19.44" length="0.10" shape="13000.00,0.00 13000.00,0.00"/>
     </edge>
     <edge id=":n14_0" function="internal">
-        <lane id=":n14_0_0" index="0" speed="19.17" length="0.10" shape="14000.00,0.00 14000.00,0.00"/>
+        <lane id=":n14_0_0" index="0" speed="19.44" length="0.10" shape="14000.00,0.00 14000.00,0.00"/>
     </edge>
     <edge id=":n15_0" function="internal">
-        <lane id=":n15_0_0" index="0" speed="19.17" length="0.10" shape="15000.00,0.00 15000.00,0.00"/>
+        <lane id=":n15_0_0" index="0" speed="19.44" length="0.10" shape="15000.00,0.00 15000.00,0.00"/>
     </edge>
     <edge id=":n16_0" function="internal">
-        <lane id=":n16_0_0" index="0" speed="19.17" length="0.10" shape="16000.00,0.00 16000.00,0.00"/>
+        <lane id=":n16_0_0" index="0" speed="19.44" length="0.10" shape="16000.00,0.00 16000.00,0.00"/>
     </edge>
     <edge id=":n17_0" function="internal">
-        <lane id=":n17_0_0" index="0" speed="19.17" length="0.10" shape="17000.00,0.00 17000.00,0.00"/>
+        <lane id=":n17_0_0" index="0" speed="19.44" length="0.10" shape="17000.00,0.00 17000.00,0.00"/>
     </edge>
     <edge id=":n18_0" function="internal">
-        <lane id=":n18_0_0" index="0" speed="19.17" length="0.10" shape="18000.00,0.00 18000.00,0.00"/>
+        <lane id=":n18_0_0" index="0" speed="19.44" length="0.10" shape="18000.00,0.00 18000.00,0.00"/>
     </edge>
     <edge id=":n19_0" function="internal">
-        <lane id=":n19_0_0" index="0" speed="19.17" length="0.10" shape="19000.00,0.00 19000.00,0.00"/>
+        <lane id=":n19_0_0" index="0" speed="19.44" length="0.10" shape="19000.00,0.00 19000.00,0.00"/>
     </edge>
     <edge id=":n2_0" function="internal">
-        <lane id=":n2_0_0" index="0" speed="19.17" length="0.10" shape="2000.00,0.00 2000.00,0.00"/>
+        <lane id=":n2_0_0" index="0" speed="19.44" length="0.10" shape="2000.00,0.00 2000.00,0.00"/>
     </edge>
     <edge id=":n20_0" function="internal">
-        <lane id=":n20_0_0" index="0" speed="19.17" length="0.10" shape="20000.00,0.00 20000.00,0.00"/>
+        <lane id=":n20_0_0" index="0" speed="19.44" length="0.10" shape="20000.00,0.00 20000.00,0.00"/>
     </edge>
     <edge id=":n21_0" function="internal">
-        <lane id=":n21_0_0" index="0" speed="19.17" length="0.10" shape="21000.00,0.00 21000.00,0.00"/>
+        <lane id=":n21_0_0" index="0" speed="19.44" length="0.10" shape="21000.00,0.00 21000.00,0.00"/>
     </edge>
     <edge id=":n22_0" function="internal">
-        <lane id=":n22_0_0" index="0" speed="19.17" length="0.10" shape="22000.00,0.00 22000.00,0.00"/>
+        <lane id=":n22_0_0" index="0" speed="19.44" length="0.10" shape="22000.00,0.00 22000.00,0.00"/>
     </edge>
     <edge id=":n23_0" function="internal">
-        <lane id=":n23_0_0" index="0" speed="19.17" length="0.10" shape="23000.00,0.00 23000.00,0.00"/>
+        <lane id=":n23_0_0" index="0" speed="19.44" length="0.10" shape="23000.00,0.00 23000.00,0.00"/>
     </edge>
     <edge id=":n24_0" function="internal">
-        <lane id=":n24_0_0" index="0" speed="19.17" length="0.10" shape="24000.00,0.00 24000.00,0.00"/>
+        <lane id=":n24_0_0" index="0" speed="19.44" length="0.10" shape="24000.00,0.00 24000.00,0.00"/>
     </edge>
     <edge id=":n25_0" function="internal">
-        <lane id=":n25_0_0" index="0" speed="19.17" length="0.10" shape="25000.00,0.00 25000.00,0.00"/>
+        <lane id=":n25_0_0" index="0" speed="19.44" length="0.10" shape="25000.00,0.00 25000.00,0.00"/>
     </edge>
     <edge id=":n26_0" function="internal">
-        <lane id=":n26_0_0" index="0" speed="19.17" length="0.10" shape="26000.00,0.00 26000.00,0.00"/>
+        <lane id=":n26_0_0" index="0" speed="19.44" length="0.10" shape="26000.00,0.00 26000.00,0.00"/>
     </edge>
     <edge id=":n3_0" function="internal">
-        <lane id=":n3_0_0" index="0" speed="19.17" length="0.10" shape="3000.00,0.00 3000.00,0.00"/>
+        <lane id=":n3_0_0" index="0" speed="19.44" length="0.10" shape="3000.00,0.00 3000.00,0.00"/>
     </edge>
     <edge id=":n4_0" function="internal">
-        <lane id=":n4_0_0" index="0" speed="19.17" length="0.10" shape="4000.00,0.00 4000.00,0.00"/>
+        <lane id=":n4_0_0" index="0" speed="19.44" length="0.10" shape="4000.00,0.00 4000.00,0.00"/>
     </edge>
     <edge id=":n5_0" function="internal">
-        <lane id=":n5_0_0" index="0" speed="19.17" length="0.10" shape="5000.00,0.00 5000.00,0.00"/>
+        <lane id=":n5_0_0" index="0" speed="19.44" length="0.10" shape="5000.00,0.00 5000.00,0.00"/>
     </edge>
     <edge id=":n6_0" function="internal">
-        <lane id=":n6_0_0" index="0" speed="19.17" length="0.10" shape="6000.00,0.00 6000.00,0.00"/>
+        <lane id=":n6_0_0" index="0" speed="19.44" length="0.10" shape="6000.00,0.00 6000.00,0.00"/>
     </edge>
     <edge id=":n7_0" function="internal">
-        <lane id=":n7_0_0" index="0" speed="19.17" length="0.10" shape="7000.00,0.00 7000.00,0.00"/>
+        <lane id=":n7_0_0" index="0" speed="19.44" length="0.10" shape="7000.00,0.00 7000.00,0.00"/>
     </edge>
     <edge id=":n8_0" function="internal">
-        <lane id=":n8_0_0" index="0" speed="19.17" length="0.10" shape="8000.00,0.00 8000.00,0.00"/>
+        <lane id=":n8_0_0" index="0" speed="19.44" length="0.10" shape="8000.00,0.00 8000.00,0.00"/>
     </edge>
     <edge id=":n9_0" function="internal">
-        <lane id=":n9_0_0" index="0" speed="19.17" length="0.10" shape="9000.00,0.00 9000.00,0.00"/>
+        <lane id=":n9_0_0" index="0" speed="19.44" length="0.10" shape="9000.00,0.00 9000.00,0.00"/>
     </edge>
 
     <edge id="e0" from="n0" to="n1" priority="1" spreadType="center">
-        <lane id="e0_0" index="0" speed="19.17" length="1000.00" shape="0.00,0.00 1000.00,0.00"/>
+        <lane id="e0_0" index="0" speed="19.44" length="1000.00" shape="0.00,0.00 1000.00,0.00"/>
     </edge>
     <edge id="e1" from="n1" to="n2" priority="1" spreadType="center">
-        <lane id="e1_0" index="0" speed="19.17" length="1000.00" shape="1000.00,0.00 2000.00,0.00"/>
+        <lane id="e1_0" index="0" speed="19.44" length="1000.00" shape="1000.00,0.00 2000.00,0.00"/>
     </edge>
     <edge id="e10" from="n10" to="n11" priority="1" spreadType="center">
-        <lane id="e10_0" index="0" speed="19.17" length="1000.00" shape="10000.00,0.00 11000.00,0.00"/>
+        <lane id="e10_0" index="0" speed="19.44" length="1000.00" shape="10000.00,0.00 11000.00,0.00"/>
     </edge>
     <edge id="e11" from="n11" to="n12" priority="1" spreadType="center">
-        <lane id="e11_0" index="0" speed="19.17" length="1000.00" shape="11000.00,0.00 12000.00,0.00"/>
+        <lane id="e11_0" index="0" speed="19.44" length="1000.00" shape="11000.00,0.00 12000.00,0.00"/>
     </edge>
     <edge id="e12" from="n12" to="n13" priority="1" spreadType="center">
-        <lane id="e12_0" index="0" speed="19.17" length="1000.00" shape="12000.00,0.00 13000.00,0.00"/>
+        <lane id="e12_0" index="0" speed="19.44" length="1000.00" shape="12000.00,0.00 13000.00,0.00"/>
     </edge>
     <edge id="e13" from="n13" to="n14" priority="1" spreadType="center">
-        <lane id="e13_0" index="0" speed="19.17" length="1000.00" shape="13000.00,0.00 14000.00,0.00"/>
+        <lane id="e13_0" index="0" speed="19.44" length="1000.00" shape="13000.00,0.00 14000.00,0.00"/>
     </edge>
     <edge id="e14" from="n14" to="n15" priority="1" spreadType="center">
-        <lane id="e14_0" index="0" speed="19.17" length="1000.00" shape="14000.00,0.00 15000.00,0.00"/>
+        <lane id="e14_0" index="0" speed="19.44" length="1000.00" shape="14000.00,0.00 15000.00,0.00"/>
     </edge>
     <edge id="e15" from="n15" to="n16" priority="1" spreadType="center">
-        <lane id="e15_0" index="0" speed="19.17" length="1000.00" shape="15000.00,0.00 16000.00,0.00"/>
+        <lane id="e15_0" index="0" speed="19.44" length="1000.00" shape="15000.00,0.00 16000.00,0.00"/>
     </edge>
     <edge id="e16" from="n16" to="n17" priority="1" spreadType="center">
-        <lane id="e16_0" index="0" speed="19.17" length="1000.00" shape="16000.00,0.00 17000.00,0.00"/>
+        <lane id="e16_0" index="0" speed="19.44" length="1000.00" shape="16000.00,0.00 17000.00,0.00"/>
     </edge>
     <edge id="e17" from="n17" to="n18" priority="1" spreadType="center">
-        <lane id="e17_0" index="0" speed="19.17" length="1000.00" shape="17000.00,0.00 18000.00,0.00"/>
+        <lane id="e17_0" index="0" speed="19.44" length="1000.00" shape="17000.00,0.00 18000.00,0.00"/>
     </edge>
     <edge id="e18" from="n18" to="n19" priority="1" spreadType="center">
-        <lane id="e18_0" index="0" speed="19.17" length="1000.00" shape="18000.00,0.00 19000.00,0.00"/>
+        <lane id="e18_0" index="0" speed="19.44" length="1000.00" shape="18000.00,0.00 19000.00,0.00"/>
     </edge>
     <edge id="e19" from="n19" to="n20" priority="1" spreadType="center">
-        <lane id="e19_0" index="0" speed="19.17" length="1000.00" shape="19000.00,0.00 20000.00,0.00"/>
+        <lane id="e19_0" index="0" speed="19.44" length="1000.00" shape="19000.00,0.00 20000.00,0.00"/>
     </edge>
     <edge id="e2" from="n2" to="n3" priority="1" spreadType="center">
-        <lane id="e2_0" index="0" speed="19.17" length="1000.00" shape="2000.00,0.00 3000.00,0.00"/>
+        <lane id="e2_0" index="0" speed="19.44" length="1000.00" shape="2000.00,0.00 3000.00,0.00"/>
     </edge>
     <edge id="e20" from="n20" to="n21" priority="1" spreadType="center">
-        <lane id="e20_0" index="0" speed="19.17" length="1000.00" shape="20000.00,0.00 21000.00,0.00"/>
+        <lane id="e20_0" index="0" speed="19.44" length="1000.00" shape="20000.00,0.00 21000.00,0.00"/>
     </edge>
     <edge id="e21" from="n21" to="n22" priority="1" spreadType="center">
-        <lane id="e21_0" index="0" speed="19.17" length="1000.00" shape="21000.00,0.00 22000.00,0.00"/>
+        <lane id="e21_0" index="0" speed="19.44" length="1000.00" shape="21000.00,0.00 22000.00,0.00"/>
     </edge>
     <edge id="e22" from="n22" to="n23" priority="1" spreadType="center">
-        <lane id="e22_0" index="0" speed="19.17" length="1000.00" shape="22000.00,0.00 23000.00,0.00"/>
+        <lane id="e22_0" index="0" speed="19.44" length="1000.00" shape="22000.00,0.00 23000.00,0.00"/>
     </edge>
     <edge id="e23" from="n23" to="n24" priority="1" spreadType="center">
-        <lane id="e23_0" index="0" speed="19.17" length="1000.00" shape="23000.00,0.00 24000.00,0.00"/>
+        <lane id="e23_0" index="0" speed="19.44" length="1000.00" shape="23000.00,0.00 24000.00,0.00"/>
     </edge>
     <edge id="e24" from="n24" to="n25" priority="1" spreadType="center">
-        <lane id="e24_0" index="0" speed="19.17" length="1000.00" shape="24000.00,0.00 25000.00,0.00"/>
+        <lane id="e24_0" index="0" speed="19.44" length="1000.00" shape="24000.00,0.00 25000.00,0.00"/>
     </edge>
     <edge id="e25" from="n25" to="n26" priority="1" spreadType="center">
-        <lane id="e25_0" index="0" speed="19.17" length="1000.00" shape="25000.00,0.00 26000.00,0.00"/>
+        <lane id="e25_0" index="0" speed="19.44" length="1000.00" shape="25000.00,0.00 26000.00,0.00"/>
     </edge>
     <edge id="e26" from="n26" to="n27" priority="1" spreadType="center">
-        <lane id="e26_0" index="0" speed="19.17" length="1000.00" shape="26000.00,0.00 27000.00,0.00"/>
+        <lane id="e26_0" index="0" speed="19.44" length="1000.00" shape="26000.00,0.00 27000.00,0.00"/>
     </edge>
     <edge id="e3" from="n3" to="n4" priority="1" spreadType="center">
-        <lane id="e3_0" index="0" speed="19.17" length="1000.00" shape="3000.00,0.00 4000.00,0.00"/>
+        <lane id="e3_0" index="0" speed="19.44" length="1000.00" shape="3000.00,0.00 4000.00,0.00"/>
     </edge>
     <edge id="e4" from="n4" to="n5" priority="1" spreadType="center">
-        <lane id="e4_0" index="0" speed="19.17" length="1000.00" shape="4000.00,0.00 5000.00,0.00"/>
+        <lane id="e4_0" index="0" speed="19.44" length="1000.00" shape="4000.00,0.00 5000.00,0.00"/>
     </edge>
     <edge id="e5" from="n5" to="n6" priority="1" spreadType="center">
-        <lane id="e5_0" index="0" speed="19.17" length="1000.00" shape="5000.00,0.00 6000.00,0.00"/>
+        <lane id="e5_0" index="0" speed="19.44" length="1000.00" shape="5000.00,0.00 6000.00,0.00"/>
     </edge>
     <edge id="e6" from="n6" to="n7" priority="1" spreadType="center">
-        <lane id="e6_0" index="0" speed="19.17" length="1000.00" shape="6000.00,0.00 7000.00,0.00"/>
+        <lane id="e6_0" index="0" speed="19.44" length="1000.00" shape="6000.00,0.00 7000.00,0.00"/>
     </edge>
     <edge id="e7" from="n7" to="n8" priority="1" spreadType="center">
-        <lane id="e7_0" index="0" speed="19.17" length="1000.00" shape="7000.00,0.00 8000.00,0.00"/>
+        <lane id="e7_0" index="0" speed="19.44" length="1000.00" shape="7000.00,0.00 8000.00,0.00"/>
     </edge>
     <edge id="e8" from="n8" to="n9" priority="1" spreadType="center">
-        <lane id="e8_0" index="0" speed="19.17" length="1000.00" shape="8000.00,0.00 9000.00,0.00"/>
+        <lane id="e8_0" index="0" speed="19.44" length="1000.00" shape="8000.00,0.00 9000.00,0.00"/>
     </edge>
     <edge id="e9" from="n9" to="n10" priority="1" spreadType="center">
-        <lane id="e9_0" index="0" speed="19.17" length="1000.00" shape="9000.00,0.00 10000.00,0.00"/>
+        <lane id="e9_0" index="0" speed="19.44" length="1000.00" shape="9000.00,0.00 10000.00,0.00"/>
     </edge>
 
     <tlLogic id="n1" type="static" programID="0" offset="0">
