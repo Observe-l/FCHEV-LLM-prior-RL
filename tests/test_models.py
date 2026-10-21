@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -13,7 +14,7 @@ from algorithm.sac import SAC
 from algorithm.hasac import HASAC
 from algorithm.td3 import TD3
 from algorithm.two_agent_sac import TwoAgentSAC
-from environment.fchev_env import FCHEVEnv
+from environment.fchev_env import FCHEVEnv, configured_termination_penalty
 from environment.scenario.build_scenario import build_scenario, generate_episode_randomization
 from train import (
     _plot_agent_episode_rewards,
@@ -31,7 +32,7 @@ from util.fcs_model import FCSModel
 from util.observation import normalize_observation
 from util.reward import (
     compute_reward, following_reward, safety_distance, speeding_reward,
-    traffic_light_reward,
+    traffic_light_reward, predicted_speed_at_limit_entry,
 )
 from util.vehicle_dynamics import longitudinal_demand
 
@@ -160,24 +161,27 @@ class DataAndPlantTests(unittest.TestCase):
             "battery_soh_loss": 1e-8,
             "edu_clr_cumulative": 1e-5,
             "edu_clr_increment": 1e-9,
-            "comfort": 0.1,
+            "comfort": -0.1,
             "following": 1.0,
             "safety_violation": False,
             "soc_penalty": 0.01,
             "collision": False,
         }
-        reward = compute_reward(components, self.cfg["reward"])
+        reward_config = copy.deepcopy(self.cfg["reward"])
+        reward_config["reward_coefficients"]["beta_5"] = 2.0
+        reward = compute_reward(components, reward_config)
         expected = {
             "following": 1.0,
             "hydrogen": -0.04,
             "fcs": -0.1,
             "battery": -0.1,
             "edu": -0.01,
-            "comfort": -0.1,
+            "comfort": -0.2,
             "soc": -0.1,
         }
         for name, value in expected.items():
             self.assertAlmostEqual(components[f"reward_contribution_{name}"], value)
+        self.assertAlmostEqual(components["cost_comfort"], 0.1)
         self.assertAlmostEqual(components["cost_fcs"], 0.00002)
         self.assertAlmostEqual(components["cost_battery"], 1e-6)
         self.assertAlmostEqual(components["cost_edu"], 1e-7)
@@ -197,7 +201,12 @@ class DataAndPlantTests(unittest.TestCase):
         close_gap = dsafe - 0.1
         self.assertAlmostEqual(
             following_reward(10.0, close_gap, 200.0, close_gap, c0, c1, c2, c3),
-            c0 - c1 * (1.0 - close_gap / dsafe) ** 2,
+            c0 - c1 * (1.0 - close_gap / dsafe) ** 3,
+        )
+        self.assertAlmostEqual(
+            following_reward(10.0, 0.5 * dsafe, 200.0, 0.5 * dsafe,
+                             c0, c1, c2, c3),
+            c0 - c1 * 0.5**3,
         )
         self.assertEqual(following_reward(10.0, 0.0, 200.0, 0.0, c0, c1, c2, c3), c0 - c1)
         self.assertEqual(following_reward(10.0, dsafe, 200.0, dsafe, c0, c1, c2, c3), c0)
@@ -228,6 +237,18 @@ class DataAndPlantTests(unittest.TestCase):
         self.assertEqual(self.cfg["reward"]["following_c1"], 10.0)
         self.assertEqual(self.cfg["reward"]["following_c2"], 3.0)
         self.assertEqual(self.cfg["reward"]["following_c3"], 0.05)
+
+    def test_following_reward_ignores_invalid_gap_sentinel(self):
+        # The environment uses 30000 m to mean that the named lead is no
+        # longer in front. That sentinel must not be interpreted as a real
+        # gap change in the catch-up reward branch.
+        self.assertEqual(
+            following_reward(
+                22.0, 30000.0, 200.0, 2.8, 5.0, 25.0, 5.0, 0.25,
+                gap_valid=False,
+            ),
+            0.0,
+        )
 
     def test_speeding_reward_is_linear_in_excess_speed_m_per_s(self):
         penalty, delta_v = speeding_reward(9.5, 30.0 / 3.6, beta=1.0)
@@ -322,6 +343,7 @@ class DataAndPlantTests(unittest.TestCase):
             "reward_contribution_following": 5.0,
             "reward_contribution_comfort": -0.2,
             "reward_contribution_speeding": -0.5,
+            "reward_contribution_speed_limit_entry": 1.5,
             "reward_contribution_zero_speed_negative_accel_penalty": -10.0,
             "reward_contribution_terminal_penalty": 0.0,
             "reward_contribution_traffic_light": 10.0,
@@ -332,7 +354,7 @@ class DataAndPlantTests(unittest.TestCase):
             "reward_contribution_soc": -5.0,
         }
         driving_reward, energy_reward = split_agent_rewards({"reward_components": parts})
-        self.assertAlmostEqual(driving_reward, 4.3)
+        self.assertAlmostEqual(driving_reward, 5.8)
         self.assertAlmostEqual(energy_reward, -15.0)
         self.assertAlmostEqual(driving_reward + energy_reward, sum(parts.values()))
 
@@ -416,6 +438,24 @@ class DataAndPlantTests(unittest.TestCase):
         self.assertTrue(np.isinf(arrival))
         self.assertFalse(active)
 
+    def test_predicted_speed_at_limit_entry_uses_constant_deceleration(self):
+        speed, error = predicted_speed_at_limit_entry(
+            19.44, 30.0 / 3.6, 100.0, 0.75
+        )
+        expected_speed = np.sqrt(19.44**2 - 2.0 * 0.75 * 100.0)
+        self.assertAlmostEqual(speed, expected_speed)
+        self.assertAlmostEqual(error, (expected_speed - 30.0 / 3.6) / (30.0 / 3.6))
+
+        lower_speed, lower_error = predicted_speed_at_limit_entry(
+            12.0, 30.0 / 3.6, 100.0, 0.75
+        )
+        self.assertLessEqual(lower_speed, 30.0 / 3.6)
+        self.assertEqual(lower_error, 0.0)
+        self.assertEqual(
+            predicted_speed_at_limit_entry(10.0, 0.0, 50.0, 0.75),
+            (10.0, 0.0),
+        )
+
     def test_reward_plot_uses_zero_vertical_baseline(self):
         import matplotlib
         matplotlib.use("Agg")
@@ -436,6 +476,29 @@ class DataAndPlantTests(unittest.TestCase):
                 for call in set_ylim.call_args_list
             ))
         self.assertEqual(self.cfg["reward"]["abnormal_termination_penalty"], -50.0)
+
+    def test_event_specific_terminal_penalties_and_legacy_fallback(self):
+        rewards = {
+            "abnormal_termination_penalty": -50.0,
+            "collision_termination_penalty": -200.0,
+            "speeding_termination_penalty": -10.0,
+            "red_light_termination_penalty": -50.0,
+        }
+        self.assertEqual(configured_termination_penalty(rewards, "collision"), -200.0)
+        self.assertEqual(configured_termination_penalty(rewards, "speeding"), -10.0)
+        self.assertEqual(
+            configured_termination_penalty(rewards, "max_speed_action"), -10.0
+        )
+        self.assertEqual(
+            configured_termination_penalty(rewards, "red_light_violation"), -50.0
+        )
+        self.assertEqual(configured_termination_penalty(rewards, "route_complete"), 0.0)
+        self.assertEqual(
+            configured_termination_penalty(
+                {"abnormal_termination_penalty": -7.0}, "collision"
+            ),
+            -7.0,
+        )
 
     def test_agent_reward_plots_are_separate_and_keep_negative_returns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -519,6 +582,60 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertTrue((second_scenario / "scenario.sumocfg").is_file())
             second.close()
 
+    def test_intersection_speed_zone_toggle_controls_lead_vehicle_cap(self):
+        with (ROOT / "config" / "default.json").open(encoding="utf-8") as f:
+            base_config = json.load(f)
+        for enabled, expected_max_speed in (
+            (True, 30.0 / 3.6),
+            (False, 70.0 / 3.6),
+        ):
+            cfg = copy.deepcopy(base_config)
+            cfg["sumo"]["intersection_speed_zone_enabled"] = enabled
+            env = FCHEVEnv(project_root=ROOT, config=cfg)
+            try:
+                env.reset(seed=147)
+                env.sumo.traci.vehicle.moveTo("lead", "e0_0", 850.0)
+                env.sumo._update_lead_intersection_speed_limit()
+                self.assertAlmostEqual(
+                    env.sumo.traci.vehicle.getMaxSpeed("lead"),
+                    expected_max_speed,
+                    places=5,
+                )
+            finally:
+                env.close()
+
+    def test_disabling_zone_uses_main_road_limit_without_speeding_penalty(self):
+        with (ROOT / "config" / "default.json").open(encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["sumo"]["intersection_speed_zone_enabled"] = False
+        env = FCHEVEnv(project_root=ROOT, config=cfg)
+        try:
+            env.reset(seed=148)
+            env.sumo.traci.vehicle.moveTo("lead", "e0_0", 500.0)
+            original_states = env.sumo.states
+
+            def report_36_kph_in_intersection(force_fresh=False):
+                states = original_states(force_fresh=force_fresh)
+                states["ego"] = dict(states["ego"])
+                states["ego"]["speed_m_s"] = 10.0
+                states["next_tls"] = {
+                    "id": "n1", "link_index": 0, "distance_m": 80.0,
+                    "state": "G", "remaining_s": 20.0,
+                }
+                return states
+
+            env.sumo.states = report_36_kph_in_intersection
+            _, _, terminated, truncated, info = env.step(np.asarray([0.0, 0.0]))
+            env.sumo.states = original_states
+            self.assertFalse(terminated)
+            self.assertFalse(truncated)
+            self.assertFalse(info["speeding_violation"])
+            self.assertFalse(info["ego_in_intersection_speed_zone"])
+            self.assertAlmostEqual(info["active_speed_limit_m_s"], 60.0 / 3.6)
+            self.assertEqual(info["speeding_penalty"], 0.0)
+        finally:
+            env.close()
+
     def test_episode_ends_when_lead_reaches_terminal_stop(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
@@ -555,9 +672,9 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(float(obs[5]), 0.0, places=6)
             self.assertAlmostEqual(float(obs[7]), 0.0, places=6)
             self.assertAlmostEqual(
-                env.vehicle_cfg["max_speed_mps"], 84.0 / 3.6, places=8
+                env.vehicle_cfg["max_speed_mps"], 70.0 / 3.6, places=8
             )
-            self.assertAlmostEqual(env._road_speed_limit_m_s(), 70.0 / 3.6)
+            self.assertAlmostEqual(env._road_speed_limit_m_s(), 60.0 / 3.6)
             self.assertIn(float(obs[9]), (0.0, 1.0, 2.0))
             self.assertGreater(float(obs[10]), 900.0)
             self.assertGreaterEqual(float(obs[11]), 0.0)
@@ -586,12 +703,12 @@ class SumoIntegrationTests(unittest.TestCase):
             route_text = route_root.read_text(encoding="utf-8")
             edge_root = ET.parse(env.scenario_cfg.parent / "road.edg.xml").getroot()
             self.assertAlmostEqual(
-                float(edge_root.find("edge").attrib["speed"]), 70.0 / 3.6, places=5
+                float(edge_root.find("edge").attrib["speed"]), 60.0 / 3.6, places=5
             )
             route_xml = ET.parse(route_root).getroot()
             self.assertAlmostEqual(
                 float(route_xml.find("vType").attrib["maxSpeed"]),
-                84.0 / 3.6, places=5,
+                70.0 / 3.6, places=5,
             )
             self.assertIn('id="lead"', route_text)
             self.assertEqual(route_text.count('departSpeed="0.000"'), 2)
@@ -721,12 +838,12 @@ class SumoIntegrationTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_positive_acceleration_beyond_global_speed_envelope_terminates_without_clipping(self):
+    def test_positive_acceleration_beyond_global_speed_envelope_is_clipped(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=29)
             # Put the ego at the configured speed limit without advancing
-            # SUMO, then verify positive acceleration terminates immediately.
+            # SUMO, then verify the requested acceleration is capped at zero.
             env.vehicle_cfg["max_speed_mps"] = 0.2
             original_states = env.sumo.states
 
@@ -741,21 +858,23 @@ class SumoIntegrationTests(unittest.TestCase):
             step_calls_before = env.sumo.step_calls
             _, reward, terminated, truncated, info = env.step(np.asarray([0.7, 0.0]))
             env.sumo.states = original_states
-            self.assertTrue(terminated)
+            self.assertFalse(terminated)
             self.assertFalse(truncated)
             self.assertTrue(info["max_speed_action_violation"])
-            self.assertEqual(info["terminated_reason"], "max_speed_action")
+            self.assertTrue(info["max_speed_action_clipped"])
+            self.assertIsNone(info["terminated_reason"])
             self.assertFalse(info["speed_limit_clip"])
             self.assertAlmostEqual(info["requested_acceleration_m_s2"], 0.7)
-            self.assertIsNone(info["executed_acceleration_m_s2"])
-            self.assertEqual(info["terminal_penalty"], -50.0)
+            self.assertAlmostEqual(info["max_speed_limited_acceleration_m_s2"], 0.0)
+            self.assertAlmostEqual(info["executed_acceleration_m_s2"], 0.0, places=5)
+            self.assertEqual(info["terminal_penalty"], 0.0)
             self.assertEqual(
                 info["reward_components"]["reward_contribution_terminal_penalty"],
-                -50.0,
+                0.0,
             )
-            self.assertEqual(reward, -50.0)
-            self.assertEqual(env.sumo.step_calls, step_calls_before)
-            self.assertEqual(env.sumo.traci.simulation.getTime(), time_before)
+            self.assertTrue(np.isfinite(reward))
+            self.assertEqual(env.sumo.step_calls, step_calls_before + 1)
+            self.assertEqual(env.sumo.traci.simulation.getTime(), time_before + 1.0)
         finally:
             env.close()
 
@@ -808,6 +927,44 @@ class SumoIntegrationTests(unittest.TestCase):
                 sum(v for k, v in info["reward_components"].items()
                     if k.startswith("reward_contribution_")),
             )
+
+            # A lead vehicle that has fallen behind the ego is represented by
+            # a large distance sentinel. On a collision terminal step, this
+            # sentinel must not be treated as a real delta-gap in following
+            # reward (which otherwise creates an artificial ~-7500 reward).
+            env.reset(seed=15)
+            original_states = env.sumo.states
+            original_collision_ids = env.sumo.collision_ids
+            states_calls = 0
+
+            def report_invalid_front_gap_on_collision():
+                nonlocal states_calls
+                states = original_states()
+                states_calls += 1
+                if states_calls == 2:
+                    states["gap_m"] = 30000.0
+                    states["front_gap_valid"] = False
+                return states
+
+            env.sumo.states = report_invalid_front_gap_on_collision
+            env.sumo.collision_ids = lambda: ["ego", "lead"]
+            try:
+                _, reward, terminated, truncated, info = env.step(
+                    np.asarray([0.0, 0.0])
+                )
+            finally:
+                env.sumo.states = original_states
+                env.sumo.collision_ids = original_collision_ids
+            self.assertTrue(terminated)
+            self.assertFalse(truncated)
+            self.assertEqual(info["terminated_reason"], "collision")
+            self.assertFalse(info["following_distance_valid"])
+            self.assertIsNone(info["following_distance_reduction_m"])
+            self.assertEqual(info["reward_components"]["following"], 0.0)
+            self.assertEqual(
+                info["reward_components"]["reward_contribution_following"], 0.0
+            )
+            self.assertGreater(reward, -100.0)
 
             env.reset(seed=14)
             original_states = env.sumo.states
@@ -882,7 +1039,7 @@ class SumoIntegrationTests(unittest.TestCase):
             same_light, before, crossed,
         ))
 
-    def test_speed_region_observation_uses_entry_distance_and_red_stop_line(self):
+    def test_speed_region_observation_is_separate_from_signal_state(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             tls = {"id": "n1", "link_index": 0, "distance_m": 150.0,
@@ -892,13 +1049,14 @@ class SumoIntegrationTests(unittest.TestCase):
                 {"lane_id": "e0_0"},
                 tls,
             )
-            self.assertAlmostEqual(current, 70.0 / 3.6)
+            self.assertAlmostEqual(current, 60.0 / 3.6)
             self.assertAlmostEqual(
                 upcoming, env.sumo_cfg["intersection_speed_limit_kph"] / 3.6
             )
             self.assertAlmostEqual(distance, 50.0)
 
-            # After entering the current zone, report the next region entry.
+            # In the 30 km/h region, the next limit is the 60 km/h road after
+            # this same signal, not the next intersection's 30 km/h region.
             tls = {"id": "n1", "link_index": 0, "distance_m": 50.0,
                    "state": "G", "remaining_s": 20.0}
             future_tls = {"id": "n2", "link_index": 0, "distance_m": 1050.0,
@@ -911,24 +1069,86 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(
                 current, env.sumo_cfg["intersection_speed_limit_kph"] / 3.6
             )
-            self.assertAlmostEqual(
-                upcoming, env.sumo_cfg["intersection_speed_limit_kph"] / 3.6
-            )
-            self.assertAlmostEqual(distance, 950.0)
+            self.assertAlmostEqual(upcoming, 60.0 / 3.6)
+            self.assertAlmostEqual(distance, 50.0)
 
-            # Red encodes a zero-speed target at its stop line.
+            # The same road location and red signal produce the same speed
+            # limits and speed-region distance.
             tls["state"] = "r"
-            current, upcoming, distance = env._speed_region_observation(
+            red_result = env._speed_region_observation(
                 {"next_tls": tls, "upcoming_tls": [tls, future_tls]},
                 {"lane_id": "e1_0"},
                 tls,
             )
-            self.assertEqual(upcoming, 0.0)
-            self.assertAlmostEqual(distance, 50.0)
+            self.assertEqual(red_result, (current, upcoming, distance))
+
+            # On the junction's internal lane, distance points to its end,
+            # where the ordinary 60 km/h road begins.
+            internal = {"lane_id": ":n1_0_0", "lane_length_m": 0.1,
+                        "lane_position_m": 0.04}
+            internal_result = env._speed_region_observation(
+                {"next_tls": future_tls, "upcoming_tls": [future_tls]},
+                internal,
+                future_tls,
+            )
+            self.assertAlmostEqual(internal_result[0], 30.0 / 3.6)
+            self.assertAlmostEqual(internal_result[1], 60.0 / 3.6)
+            self.assertAlmostEqual(internal_result[2], 0.06)
         finally:
             env.close()
 
-    def test_intersection_speeding_terminates_at_20_percent_over_limit_with_penalty(self):
+    def test_intersection_speed_zone_toggle_controls_observation(self):
+        with (ROOT / "config" / "default.json").open(encoding="utf-8") as f:
+            base_config = json.load(f)
+        tls = {"id": "n1", "link_index": 0, "distance_m": 150.0,
+               "state": "G", "remaining_s": 20.0}
+        states = {"next_tls": tls, "upcoming_tls": [tls]}
+        ego = {"lane_id": "e0_0"}
+        for enabled, expected_next, expected_distance in (
+            (True, 30.0 / 3.6, 50.0),
+            (False, 60.0 / 3.6, 30000.0),
+        ):
+            cfg = copy.deepcopy(base_config)
+            cfg["sumo"]["intersection_speed_zone_enabled"] = enabled
+            env = FCHEVEnv(project_root=ROOT, config=cfg)
+            try:
+                current, upcoming, distance = env._speed_region_observation(
+                    states, ego, tls
+                )
+                self.assertAlmostEqual(current, 60.0 / 3.6)
+                self.assertAlmostEqual(upcoming, expected_next)
+                self.assertAlmostEqual(distance, expected_distance)
+                self.assertEqual(
+                    env._inside_intersection_speed_zone(ego, tls, 100.0), False
+                )
+                zone_tls = dict(tls, distance_m=50.0)
+                zone = env._speed_region_observation(
+                    {"next_tls": zone_tls, "upcoming_tls": [zone_tls]},
+                    ego,
+                    zone_tls,
+                )
+                self.assertAlmostEqual(
+                    zone[0], 30.0 / 3.6 if enabled else 60.0 / 3.6
+                )
+                self.assertEqual(
+                    env._inside_intersection_speed_zone(ego, zone_tls, 100.0),
+                    enabled,
+                )
+                red_tls = dict(tls, state="r", distance_m=50.0)
+                red = env._speed_region_observation(
+                    {"next_tls": red_tls, "upcoming_tls": [red_tls]}, ego, red_tls
+                )
+                self.assertAlmostEqual(
+                    red[0], 30.0 / 3.6 if enabled else 60.0 / 3.6
+                )
+                self.assertAlmostEqual(red[1], 60.0 / 3.6)
+                self.assertAlmostEqual(
+                    red[2], 50.0 if enabled else 30000.0
+                )
+            finally:
+                env.close()
+
+    def test_intersection_speeding_is_penalized_without_termination(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=143)
@@ -947,21 +1167,104 @@ class SumoIntegrationTests(unittest.TestCase):
 
             _, reward, terminated, truncated, info = env.step(np.asarray([0.0, 0.0]))
             env.sumo.states = original_states
-            self.assertTrue(terminated)
+            self.assertFalse(terminated)
             self.assertFalse(truncated)
-            self.assertEqual(info["terminated_reason"], "speeding")
+            self.assertIsNone(info["terminated_reason"])
             self.assertTrue(info["speeding_violation"])
             self.assertIn("ego", info["speeding_vehicles"])
-            self.assertEqual(info["terminal_penalty"], -50.0)
+            self.assertEqual(info["terminal_penalty"], 0.0)
             self.assertAlmostEqual(info["active_speed_limit_m_s"], 30.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_delta_v_m_s"], 10.0 - 30.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_penalty"], -(10.0 - 30.0 / 3.6))
+            self.assertGreater(info["speeding_delta_v_m_s"], 0.0)
+            self.assertAlmostEqual(
+                info["speeding_penalty"],
+                -100.0 * info["speeding_delta_v_m_s"],
+            )
             self.assertEqual(info["collision_penalty"], 0.0)
             self.assertEqual(info["speed_limit_positive_accel_penalty"], 0.0)
         finally:
             env.close()
 
-    def test_intersection_overspeed_below_20_percent_gets_linear_penalty_only(self):
+    def test_speed_limit_entry_metrics_ignore_signal_state_and_stop_target(self):
+        with (ROOT / "config" / "default.json").open(encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["sumo"]["intersection_speed_zone_enabled"] = True
+        env = FCHEVEnv(project_root=ROOT, config=cfg)
+        try:
+            # The speed-zone predictor targets the actual 30 km/h zone entry;
+            # red does not turn it into a 0 km/h target.
+            tls = {"id": "n1", "distance_m": 300.0, "state": "r"}
+            states = {
+                "ego": {"speed_m_s": 19.44, "lane_id": "e0_0"},
+                "next_tls": tls,
+                "upcoming_tls": [tls],
+            }
+            metrics = env._speed_limit_entry_metrics(states)
+            self.assertTrue(metrics["active"])
+            self.assertAlmostEqual(metrics["speed_limit_m_s"], 30.0 / 3.6)
+            self.assertAlmostEqual(metrics["distance_m"], 200.0)
+            self.assertAlmostEqual(
+                metrics["predicted_speed_m_s"],
+                np.sqrt(19.44**2 - 2.0 * 0.75 * 200.0),
+            )
+            green_states = dict(states, next_tls=dict(tls, state="G"),
+                                upcoming_tls=[dict(tls, state="G")])
+            green_metrics = env._speed_limit_entry_metrics(green_states)
+            self.assertEqual(metrics, green_metrics)
+
+            # Inside the zone, the next limit is 70 km/h after this signal;
+            # only excess over the current 30 km/h cap is measured. Stopping
+            # below that cap adds no additional speed-limit reward.
+            tls["distance_m"] = 50.0
+            zone_states = {
+                "ego": {"speed_m_s": 10.0, "lane_id": "e1_0"},
+                "next_tls": tls,
+                "upcoming_tls": [tls],
+            }
+            metrics = env._speed_limit_entry_metrics(zone_states)
+            self.assertAlmostEqual(metrics["distance_m"], 0.0)
+            self.assertAlmostEqual(metrics["predicted_speed_m_s"], 10.0)
+            self.assertGreater(metrics["error"], 0.0)
+            stopped_states = dict(zone_states, ego={
+                "speed_m_s": 0.0, "lane_id": "e1_0",
+            })
+            stopped = env._speed_limit_entry_metrics(stopped_states)
+            self.assertEqual(stopped["error"], 0.0)
+            self.assertAlmostEqual(stopped["speed_limit_m_s"], 30.0 / 3.6)
+        finally:
+            env.close()
+
+    def test_speed_limit_entry_reward_suppresses_boundary_and_terminal_bonus(self):
+        before = {"error": 0.1837963090837001, "mode": "current_zone"}
+        after = {"error": 0.0, "mode": "upcoming_zone"}
+        result = FCHEVEnv._speed_limit_entry_reward(
+            before, after, beta=500.0, terminal_violation=True
+        )
+        # Regression for HASAC episode 235: at the junction exit, the future
+        # zone is far enough away that its predicted entry error becomes zero.
+        # That context reset must not be converted into an artificial +91.9.
+        self.assertAlmostEqual(result["raw_error_delta"], before["error"])
+        self.assertEqual(result["error_delta"], 0.0)
+        self.assertEqual(result["reward"], 0.0)
+        self.assertTrue(result["positive_capped"])
+        self.assertTrue(result["context_changed"])
+
+        # Normal within-region progress still receives signed shaping.
+        same_region = FCHEVEnv._speed_limit_entry_reward(
+            {"error": 0.2, "mode": "upcoming_zone"},
+            {"error": 0.1, "mode": "upcoming_zone"},
+            beta=500.0,
+        )
+        self.assertAlmostEqual(same_region["reward"], 50.0)
+
+        # Error growth remains penalized even if the zone context changes.
+        worsening = FCHEVEnv._speed_limit_entry_reward(
+            {"error": 0.1, "mode": "current_zone"},
+            {"error": 0.2, "mode": "upcoming_zone"},
+            beta=500.0,
+        )
+        self.assertAlmostEqual(worsening["reward"], -50.0)
+
+    def test_intersection_overspeed_gets_linear_penalty_without_termination(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=142)
@@ -982,9 +1285,12 @@ class SumoIntegrationTests(unittest.TestCase):
             self.assertFalse(terminated)
             self.assertFalse(truncated)
             self.assertIsNone(info["terminated_reason"])
-            self.assertFalse(info["speeding_violation"])
+            self.assertTrue(info["speeding_violation"])
             self.assertAlmostEqual(info["speeding_delta_v_m_s"], 9.5 - 30.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_penalty"], -(9.5 - 30.0 / 3.6))
+            self.assertAlmostEqual(
+                info["speeding_penalty"],
+                -100.0 * (9.5 - 30.0 / 3.6),
+            )
             self.assertEqual(info["terminal_penalty"], 0.0)
             self.assertAlmostEqual(
                 reward,
@@ -994,7 +1300,7 @@ class SumoIntegrationTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_ordinary_road_speeding_between_70_and_84_kph_is_penalized_not_terminated(self):
+    def test_ordinary_road_speeding_is_penalized_without_termination(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=144)
@@ -1004,7 +1310,7 @@ class SumoIntegrationTests(unittest.TestCase):
             def report_ordinary_road_speed(force_fresh=False):
                 states = original_states(force_fresh=force_fresh)
                 states["ego"] = dict(states["ego"])
-                states["ego"]["speed_m_s"] = 75.0 / 3.6
+                states["ego"]["speed_m_s"] = 70.0 / 3.6
                 states["next_tls"] = {
                     "id": "n1", "link_index": 0, "distance_m": 500.0,
                     "state": "G", "remaining_s": 20.0,
@@ -1012,52 +1318,25 @@ class SumoIntegrationTests(unittest.TestCase):
                 return states
 
             env.sumo.states = report_ordinary_road_speed
-            # Positive acceleration from 75 km/h must not hit the old 70 km/h
-            # hard action guard; it remains below the 84 km/h threshold.
+            # Posted-limit excess is penalized while the 70 km/h vehicle cap
+            # remains independent and episode termination is disabled.
             _, _, terminated, truncated, info = env.step(np.asarray([0.7, 0.0]))
             env.sumo.states = original_states
             self.assertFalse(terminated)
             self.assertFalse(truncated)
             self.assertIsNone(info["terminated_reason"])
-            self.assertFalse(info["speeding_violation"])
-            self.assertAlmostEqual(info["active_speed_limit_m_s"], 70.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_delta_v_m_s"], 5.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_penalty"], -(5.0 / 3.6))
-        finally:
-            env.close()
-
-    def test_ordinary_road_speeding_terminates_at_84_kph_with_penalties(self):
-        env = FCHEVEnv(project_root=ROOT)
-        try:
-            env.reset(seed=145)
-            env.sumo.traci.vehicle.moveTo("lead", "e0_0", 500.0)
-            original_states = env.sumo.states
-
-            def report_ordinary_road_speed(force_fresh=False):
-                states = original_states(force_fresh=force_fresh)
-                states["ego"] = dict(states["ego"])
-                states["ego"]["speed_m_s"] = 84.0 / 3.6
-                states["next_tls"] = {
-                    "id": "n1", "link_index": 0, "distance_m": 500.0,
-                    "state": "G", "remaining_s": 20.0,
-                }
-                return states
-
-            env.sumo.states = report_ordinary_road_speed
-            _, _, terminated, truncated, info = env.step(np.asarray([0.0, 0.0]))
-            env.sumo.states = original_states
-            self.assertTrue(terminated)
-            self.assertFalse(truncated)
-            self.assertEqual(info["terminated_reason"], "speeding")
             self.assertTrue(info["speeding_violation"])
-            self.assertAlmostEqual(info["active_speed_limit_m_s"], 70.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_delta_v_m_s"], 14.0 / 3.6)
-            self.assertAlmostEqual(info["speeding_penalty"], -(14.0 / 3.6))
-            self.assertEqual(info["terminal_penalty"], -50.0)
+            self.assertTrue(info["max_speed_action_clipped"])
+            self.assertAlmostEqual(info["active_speed_limit_m_s"], 60.0 / 3.6)
+            self.assertGreater(info["speeding_delta_v_m_s"], 0.0)
+            self.assertAlmostEqual(
+                info["speeding_penalty"],
+                -100.0 * info["speeding_delta_v_m_s"],
+            )
         finally:
             env.close()
 
-    def test_red_light_crossing_terminates_with_50_point_penalty(self):
+    def test_red_light_crossing_is_recorded_without_termination_or_penalty(self):
         env = FCHEVEnv(project_root=ROOT)
         try:
             env.reset(seed=56)
@@ -1074,15 +1353,15 @@ class SumoIntegrationTests(unittest.TestCase):
             traci.trafficlight.setPhaseDuration(tls["id"], 30.0)
 
             _, reward, terminated, truncated, info = env.step([0.7, 0.0])
-            self.assertTrue(terminated)
+            self.assertFalse(terminated)
             self.assertFalse(truncated)
-            self.assertEqual(info["terminated_reason"], "red_light_violation")
+            self.assertIsNone(info["terminated_reason"])
             self.assertTrue(info["red_light_violation"])
-            self.assertEqual(info["terminal_penalty"], -50.0)
+            self.assertEqual(info["terminal_penalty"], 0.0)
             self.assertEqual(info["collision_penalty"], 0.0)
             self.assertEqual(
                 info["reward_components"]["reward_contribution_terminal_penalty"],
-                -50.0,
+                0.0,
             )
             self.assertAlmostEqual(
                 reward,
@@ -1090,7 +1369,7 @@ class SumoIntegrationTests(unittest.TestCase):
                     if k.startswith("reward_contribution_")),
             )
             self.assertAlmostEqual(info["requested_acceleration_m_s2"], 0.7, places=6)
-            self.assertAlmostEqual(info["executed_acceleration_m_s2"], 0.7, places=6)
+            self.assertGreater(info["executed_acceleration_m_s2"], 0.0)
         finally:
             env.close()
 

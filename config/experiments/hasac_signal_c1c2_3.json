@@ -14,6 +14,7 @@
     "signal_red_s": 47,
     "intersection_speed_limit_kph": 30.0,
     "road_speed_limit_kph": 70.0,
+    "intersection_speed_zone_enabled": true,
     "intersection_speed_zone_m": 100.0,
     "intersection_speed_approach_m": 200.0,
     "lead_stop_duration_range_s": [

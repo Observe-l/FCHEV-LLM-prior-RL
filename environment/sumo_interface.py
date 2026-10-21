@@ -8,6 +8,9 @@ import sys
 import uuid
 
 
+NO_FRONT_GAP_M = 30000.0
+
+
 def _load_traci():
     try:
         import traci
@@ -41,6 +44,7 @@ class SumoInterface:
         self.signal_count = int(config["signal_count"])
         self.randomization = None
         self._lead_speed_limit_active = False
+        self._lane_length_cache = {}
 
     @staticmethod
     def _resolve_binary(binary: str):
@@ -166,9 +170,11 @@ class SumoInterface:
             lane_id = res.get(c.VAR_LANE_ID)
             if lane_id is None:
                 lane_id = self.traci.vehicle.getLaneID(vehicle_id)
+            lane_length = self.lane_length_m(str(lane_id))
             out[vehicle_id] = {
                 "x_m": float(pos[0]), "y_m": float(pos[1]),
                 "lane_position_m": float(lane_position),
+                "lane_length_m": float(lane_length),
                 "speed_m_s": float(speed),
                 "acceleration_m_s2": float(acceleration),
                 "length_m": float(length),
@@ -180,14 +186,18 @@ class SumoInterface:
                 # No front gap exists once the named lead is behind the ego.
                 # Do not misclassify a negative relative position as overlap;
                 # actual contacts are reported separately by SUMO collisions.
-                gap = 30000.0
+                gap = NO_FRONT_GAP_M
+                out["front_gap_valid"] = False
             elif leader and leader[0] == "lead":
                 gap = float(leader[1])
+                out["front_gap_valid"] = True
             else:
                 gap = out["lead"]["x_m"] - out["ego"]["x_m"] - out["ego"]["length_m"]
+                out["front_gap_valid"] = True
             out["gap_m"] = max(-out["ego"]["length_m"], gap)
         else:
             out["gap_m"] = float("inf")
+            out["front_gap_valid"] = False
         out["time_s"] = float(self.traci.simulation.getTime())
         out["upcoming_tls"] = (
             self.traffic_lights_ahead("ego") if out["ego"] is not None else []
@@ -195,6 +205,22 @@ class SumoInterface:
         out["next_tls"] = out["upcoming_tls"][0] if out["upcoming_tls"] else None
         out["lead_next_tls"] = self.next_tls("lead") if out["lead"] is not None else None
         return out
+
+    def lane_length_m(self, lane_id: str):
+        """Return a lane's length in meters, caching the static network value."""
+        lane_id = str(lane_id)
+        if lane_id in self._lane_length_cache:
+            return self._lane_length_cache[lane_id]
+        try:
+            self.traci.switch(self.label)
+            length = float(self.traci.lane.getLength(lane_id))
+        except Exception:
+            # Internal lane IDs vary with network generation. Returning zero
+            # lets callers keep the stop-line boundary as a conservative
+            # fallback when a lane is unavailable.
+            length = 0.0
+        self._lane_length_cache[lane_id] = length
+        return length
 
     def traffic_lights_ahead(self, vehicle_id: str = "ego"):
         self.traci.switch(self.label)
@@ -229,14 +255,15 @@ class SumoInterface:
         return ahead[0] if ahead else None
 
     def _update_lead_intersection_speed_limit(self):
-        """Apply the 30 km/h limit before the lead reaches an intersection."""
+        """Apply the optional 30 km/h limit before the lead reaches a signal."""
         if "lead" not in self.traci.vehicle.getIDList():
             return
         lane_id = self.traci.vehicle.getLaneID("lead")
         tls = self.next_tls("lead")
         approach_m = float(self.cfg.get("intersection_speed_approach_m", 200.0))
         in_approach = bool(tls is not None and 0.0 <= tls["distance_m"] <= approach_m)
-        should_limit = lane_id.startswith(":") or in_approach
+        zone_enabled = bool(self.cfg.get("intersection_speed_zone_enabled", True))
+        should_limit = zone_enabled and (lane_id.startswith(":") or in_approach)
         if should_limit == self._lead_speed_limit_active:
             return
         self.traci.vehicle.setMaxSpeed(

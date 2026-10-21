@@ -110,7 +110,7 @@ def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict,
     ET.ElementTree(nodes).write(node_file, encoding="utf-8", xml_declaration=True)
 
     edges = ET.Element("edges")
-    road_speed_limit = float(sumo_cfg.get("road_speed_limit_kph", 70.0)) / 3.6
+    road_speed_limit = float(sumo_cfg.get("road_speed_limit_kph", 60.0)) / 3.6
     vehicle_max_speed = float(vehicle_cfg["max_speed_mps"])
     for i in range(n_tls + 2):
         ET.SubElement(edges, "edge", {

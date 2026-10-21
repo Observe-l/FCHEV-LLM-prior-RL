@@ -29,7 +29,7 @@ TRACE_FIELDS = [
     "soc", "battery_soh", "fcs_soh", "edu_soh",
     "core_temperature_c", "surface_temperature_c", "ego_speed_m_s",
     "ego_acceleration_m_s2", "lead_speed_m_s", "lead_acceleration_m_s2",
-    "ego_x_m", "lead_x_m", "following_distance_m",
+    "ego_x_m", "lead_x_m", "following_distance_m", "following_distance_valid",
     "following_distance_reduction_m",
     "action_policy_acceleration_unit", "action_policy_fcs_power_unit",
     "action_requested_acceleration_raw_m_s2", "action_requested_fcs_power_raw_kw",
@@ -56,8 +56,16 @@ TRACE_FIELDS = [
     "traffic_light_remaining_s", "time_to_traffic_light_s",
     "traffic_light_reward_active", "traffic_light_reward",
     "traffic_light_reward_contribution",
+    "speed_limit_entry_active", "speed_limit_entry_error_before",
+    "speed_limit_entry_error_after",
+    "speed_limit_entry_predicted_speed_before_m_s",
+    "speed_limit_entry_predicted_speed_after_m_s",
+    "speed_limit_entry_target_m_s", "speed_limit_entry_distance_m",
+    "speed_limit_entry_reward", "speed_limit_entry_beta",
     "current_speed_limit_m_s", "next_speed_limit_m_s",
     "distance_to_next_speed_region_m", "max_speed_action_violation",
+    "max_speed_action_clipped", "max_speed_limited_acceleration_m_s2",
+    "max_speed_clip_delta_m_s2",
     "gap_over_diagnostic_threshold", "gap_over_monitor_threshold",
     "stuck_steps", "stuck_duration_s", "leader_terminal_stop_reached", "abnormal_termination",
     "terminal_penalty", "terminated_reason", "safety_violations", "constraint_clipping",
@@ -76,10 +84,12 @@ TRACE_FIELDS = [
     "reward_beta_following", "reward_beta_hydrogen", "reward_beta_fcs",
     "reward_beta_battery", "reward_beta_edu", "reward_beta_comfort", "reward_beta_soc",
     "reward_beta_traffic_light", "reward_beta_speeding",
+    "reward_beta_speed_limit_entry",
     "reward_contribution_following", "reward_contribution_hydrogen",
     "reward_contribution_fcs", "reward_contribution_battery",
     "reward_contribution_edu", "reward_contribution_comfort", "reward_contribution_soc",
     "reward_contribution_traffic_light", "reward_contribution_speeding",
+    "reward_contribution_speed_limit_entry",
     "reward_contribution_terminal_penalty",
     "zero_speed_negative_accel_penalty",
     "reward_contribution_zero_speed_negative_accel_penalty",
@@ -87,11 +97,11 @@ TRACE_FIELDS = [
 REWARD_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
     "traffic_light", "speeding", "terminal_penalty",
-    "zero_speed_negative_accel_penalty",
+    "zero_speed_negative_accel_penalty", "speed_limit_entry",
 )
 REWARD_BETA_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
-    "traffic_light", "speeding",
+    "traffic_light", "speeding", "speed_limit_entry",
 )
 DRIVING_OBSERVATION_INDICES = (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
 ENERGY_OBSERVATION_INDICES = (0, 1, 2, 3)
@@ -163,7 +173,8 @@ def split_agent_rewards(info):
 
     driving_reward = sum(contribution(name) for name in (
         "following", "comfort", "traffic_light", "speeding",
-        "zero_speed_negative_accel_penalty", "terminal_penalty"
+        "zero_speed_negative_accel_penalty", "speed_limit_entry",
+        "terminal_penalty"
     ))
     energy_reward = sum(contribution(name) for name in (
         "hydrogen", "fcs", "battery", "edu", "soc"
@@ -415,7 +426,7 @@ def _plot_reward_components(episodes_csv: Path, output_png: Path, window: int = 
     fig, ax = plt.subplots(figsize=(11, 6), constrained_layout=True)
     colors = (
         "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2",
-        "#FF9DA6", "#9D755D", "#BAB0AC", "#ECA82C", "#5F9ED1",
+        "#FF9DA6", "#9D755D", "#BAB0AC", "#ECA82C", "#5F9ED1", "#1F9E89",
     )
     for name, color in zip(REWARD_COMPONENTS, colors):
         values = np.asarray([float(row[f"reward_component_{name}"]) for row in rows], dtype=np.float64)
@@ -773,6 +784,7 @@ def main(argv=None):
                     "lead_acceleration_m_s2": info.get("lead_acceleration_m_s2"),
                     "ego_x_m": info.get("ego_x_m"), "lead_x_m": info.get("lead_x_m"),
                     "following_distance_m": info.get("following_distance_m"),
+                    "following_distance_valid": info.get("following_distance_valid"),
                     "following_distance_reduction_m": info.get("following_distance_reduction_m"),
                     "action_policy_acceleration_unit": float(action_unit[0]),
                     "action_policy_fcs_power_unit": float(action_unit[1]),
@@ -832,10 +844,36 @@ def main(argv=None):
                     "traffic_light_reward_contribution": info.get(
                         "traffic_light_reward_contribution"
                     ),
+                    "speed_limit_entry_active": info.get("speed_limit_entry_active"),
+                    "speed_limit_entry_error_before": info.get(
+                        "speed_limit_entry_error_before"
+                    ),
+                    "speed_limit_entry_error_after": info.get(
+                        "speed_limit_entry_error_after"
+                    ),
+                    "speed_limit_entry_predicted_speed_before_m_s": info.get(
+                        "speed_limit_entry_predicted_speed_before_m_s"
+                    ),
+                    "speed_limit_entry_predicted_speed_after_m_s": info.get(
+                        "speed_limit_entry_predicted_speed_after_m_s"
+                    ),
+                    "speed_limit_entry_target_m_s": info.get(
+                        "speed_limit_entry_target_m_s"
+                    ),
+                    "speed_limit_entry_distance_m": info.get(
+                        "speed_limit_entry_distance_m"
+                    ),
+                    "speed_limit_entry_reward": info.get("speed_limit_entry_reward"),
+                    "speed_limit_entry_beta": info.get("speed_limit_entry_beta"),
                     "current_speed_limit_m_s": info.get("current_speed_limit_m_s"),
                     "next_speed_limit_m_s": info.get("next_speed_limit_m_s"),
                     "distance_to_next_speed_region_m": info.get("distance_to_next_speed_region_m"),
                     "max_speed_action_violation": info.get("max_speed_action_violation"),
+                    "max_speed_action_clipped": info.get("max_speed_action_clipped"),
+                    "max_speed_limited_acceleration_m_s2": info.get(
+                        "max_speed_limited_acceleration_m_s2"
+                    ),
+                    "max_speed_clip_delta_m_s2": info.get("max_speed_clip_delta_m_s2"),
                     "gap_overlap": info.get("gap_overlap"),
                     "gap_over_diagnostic_threshold": info.get("gap_over_diagnostic_threshold"),
                     "gap_over_monitor_threshold": info.get("gap_over_monitor_threshold"),
