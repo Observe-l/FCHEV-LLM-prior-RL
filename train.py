@@ -30,7 +30,8 @@ TRACE_FIELDS = [
     "core_temperature_c", "surface_temperature_c", "ego_speed_m_s",
     "ego_acceleration_m_s2", "lead_speed_m_s", "lead_acceleration_m_s2",
     "ego_x_m", "lead_x_m", "following_distance_m", "following_distance_valid",
-    "following_distance_reduction_m",
+    "following_distance_reduction_m", "following_forward_distance_m",
+    "following_region_max_speed_m_s",
     "action_policy_acceleration_unit", "action_policy_fcs_power_unit",
     "action_requested_acceleration_raw_m_s2", "action_requested_fcs_power_raw_kw",
     "action_bounded_acceleration_m_s2", "action_bounded_fcs_power_kw",
@@ -46,10 +47,12 @@ TRACE_FIELDS = [
     "fcs_high_power_degradation_percent", "fcs_load_change_degradation_percent",
     "dc_bus_dump_power_w", "collision_count", "collision_event", "gap_overlap",
     "red_light_violation", "speeding_violation", "speeding_vehicles",
+    "speeding_termination_violation", "speeding_termination_threshold_m_s",
     "ego_in_intersection_speed_zone", "lead_in_intersection_speed_zone",
     "intersection_speed_limit_m_s", "active_speed_limit_m_s",
     "speeding_delta_v_m_s", "speeding_penalty_beta", "speeding_penalty",
     "traffic_light_crossing",
+    "green_light_crossing", "green_light_crossing_bonus",
     "traffic_light_crossed_id", "traffic_lights_passed",
     "lead_traffic_light_crossing", "lead_traffic_light_crossed_id",
     "lead_traffic_lights_passed", "traffic_light_state", "traffic_light_distance_m",
@@ -62,7 +65,8 @@ TRACE_FIELDS = [
     "speed_limit_entry_predicted_speed_after_m_s",
     "speed_limit_entry_target_m_s", "speed_limit_entry_distance_m",
     "speed_limit_entry_reward", "speed_limit_entry_beta",
-    "current_speed_limit_m_s", "next_speed_limit_m_s",
+    "current_speed_limit_m_s", "current_speed_limit_at_action_m_s",
+    "next_speed_limit_m_s",
     "distance_to_next_speed_region_m", "max_speed_action_violation",
     "max_speed_action_clipped", "max_speed_limited_acceleration_m_s2",
     "max_speed_clip_delta_m_s2",
@@ -70,6 +74,7 @@ TRACE_FIELDS = [
     "stuck_steps", "stuck_duration_s", "leader_terminal_stop_reached", "abnormal_termination",
     "terminal_penalty", "terminated_reason", "safety_violations", "constraint_clipping",
     "physical_powertrain_clip", "no_reverse_clip", "speed_limit_clip",
+    "zero_speed_negative_accel_action", "speed_limit_positive_accel_action",
     "regen_torque_clipped_for_limits", "fcs_power_clipped_for_battery_limits",
     "sumo_acceleration_intervention", "power_balance_residual_w",
     "battery_power_min_w", "battery_power_max_w",
@@ -89,15 +94,20 @@ TRACE_FIELDS = [
     "reward_contribution_fcs", "reward_contribution_battery",
     "reward_contribution_edu", "reward_contribution_comfort", "reward_contribution_soc",
     "reward_contribution_traffic_light", "reward_contribution_speeding",
+    "reward_contribution_green_light_crossing_bonus",
     "reward_contribution_speed_limit_entry",
     "reward_contribution_terminal_penalty",
     "zero_speed_negative_accel_penalty",
     "reward_contribution_zero_speed_negative_accel_penalty",
+    "speed_limit_positive_accel_penalty",
+    "reward_contribution_speed_limit_positive_accel_penalty",
 ]
 REWARD_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
     "traffic_light", "speeding", "terminal_penalty",
-    "zero_speed_negative_accel_penalty", "speed_limit_entry",
+    "green_light_crossing_bonus",
+    "zero_speed_negative_accel_penalty", "speed_limit_positive_accel_penalty",
+    "speed_limit_entry",
 )
 REWARD_BETA_COMPONENTS = (
     "hydrogen", "fcs", "battery", "edu", "comfort", "following", "soc",
@@ -173,7 +183,9 @@ def split_agent_rewards(info):
 
     driving_reward = sum(contribution(name) for name in (
         "following", "comfort", "traffic_light", "speeding",
-        "zero_speed_negative_accel_penalty", "speed_limit_entry",
+        "green_light_crossing_bonus",
+        "zero_speed_negative_accel_penalty",
+        "speed_limit_positive_accel_penalty", "speed_limit_entry",
         "terminal_penalty"
     ))
     energy_reward = sum(contribution(name) for name in (
@@ -786,6 +798,10 @@ def main(argv=None):
                     "following_distance_m": info.get("following_distance_m"),
                     "following_distance_valid": info.get("following_distance_valid"),
                     "following_distance_reduction_m": info.get("following_distance_reduction_m"),
+                    "following_forward_distance_m": info.get("following_forward_distance_m"),
+                    "following_region_max_speed_m_s": info.get(
+                        "following_region_max_speed_m_s"
+                    ),
                     "action_policy_acceleration_unit": float(action_unit[0]),
                     "action_policy_fcs_power_unit": float(action_unit[1]),
                     "action_requested_acceleration_raw_m_s2": info.get("requested_acceleration_raw_m_s2"),
@@ -822,6 +838,12 @@ def main(argv=None):
                     "red_light_violation": info.get("red_light_violation"),
                     "speeding_violation": info.get("speeding_violation"),
                     "speeding_vehicles": ";".join(info.get("speeding_vehicles", [])),
+                    "speeding_termination_violation": info.get(
+                        "speeding_termination_violation"
+                    ),
+                    "speeding_termination_threshold_m_s": info.get(
+                        "speeding_termination_threshold_m_s"
+                    ),
                     "ego_in_intersection_speed_zone": info.get("ego_in_intersection_speed_zone"),
                     "lead_in_intersection_speed_zone": info.get("lead_in_intersection_speed_zone"),
                     "intersection_speed_limit_m_s": info.get("intersection_speed_limit_m_s"),
@@ -830,6 +852,10 @@ def main(argv=None):
                     "speeding_penalty_beta": info.get("speeding_penalty_beta"),
                     "speeding_penalty": info.get("speeding_penalty"),
                     "traffic_light_crossing": info.get("traffic_light_crossing"),
+                    "green_light_crossing": info.get("green_light_crossing"),
+                    "green_light_crossing_bonus": info.get(
+                        "green_light_crossing_bonus"
+                    ),
                     "traffic_light_crossed_id": info.get("traffic_light_crossed_id"),
                     "traffic_lights_passed": info.get("traffic_lights_passed"),
                     "lead_traffic_light_crossing": info.get("lead_traffic_light_crossing"),
@@ -866,6 +892,9 @@ def main(argv=None):
                     "speed_limit_entry_reward": info.get("speed_limit_entry_reward"),
                     "speed_limit_entry_beta": info.get("speed_limit_entry_beta"),
                     "current_speed_limit_m_s": info.get("current_speed_limit_m_s"),
+                    "current_speed_limit_at_action_m_s": info.get(
+                        "current_speed_limit_at_action_m_s"
+                    ),
                     "next_speed_limit_m_s": info.get("next_speed_limit_m_s"),
                     "distance_to_next_speed_region_m": info.get("distance_to_next_speed_region_m"),
                     "max_speed_action_violation": info.get("max_speed_action_violation"),
@@ -888,6 +917,12 @@ def main(argv=None):
                     "physical_powertrain_clip": info.get("physical_powertrain_clip"),
                     "no_reverse_clip": info.get("no_reverse_clip"),
                     "speed_limit_clip": info.get("speed_limit_clip"),
+                    "zero_speed_negative_accel_action": info.get(
+                        "zero_speed_negative_accel_action"
+                    ),
+                    "speed_limit_positive_accel_action": info.get(
+                        "speed_limit_positive_accel_action"
+                    ),
                     "regen_torque_clipped_for_limits": info.get("regen_torque_clipped_for_limits"),
                     "fcs_power_clipped_for_battery_limits": info.get("fcs_power_clipped_for_battery_limits"),
                     "sumo_acceleration_intervention": info.get("sumo_acceleration_intervention"),
@@ -906,6 +941,9 @@ def main(argv=None):
                     "reward_soc_penalty": reward_parts.get("soc_penalty"),
                     "zero_speed_negative_accel_penalty": reward_parts.get(
                         "zero_speed_negative_accel_penalty"
+                    ),
+                    "speed_limit_positive_accel_penalty": reward_parts.get(
+                        "speed_limit_positive_accel_penalty"
                     ),
                     "reward_cost_following": reward_parts.get("cost_following"),
                     "reward_cost_hydrogen_g": reward_parts.get("cost_hydrogen"),

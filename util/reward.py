@@ -12,11 +12,19 @@ def safety_distance(speed_m_s: float):
 
 
 def speeding_reward(speed_m_s: float, speed_limit_m_s: float, beta: float = 1.0):
-    """Return a linear overspeed penalty and excess speed, both in SI units."""
+    """Return a penalty proportional to fractional overspeed and excess speed.
+
+    The penalty is zero at or below the posted limit and otherwise equals
+    ``-beta * (speed - speed_limit) / speed_limit``. The returned excess speed
+    remains in m/s for trajectory logging. A nonpositive limit is invalid for
+    a percentage calculation and therefore produces no penalty.
+    """
     speed = max(0.0, float(speed_m_s))
     speed_limit = max(0.0, float(speed_limit_m_s))
     delta_v = max(0.0, speed - speed_limit)
-    return -float(beta) * delta_v, delta_v
+    if speed_limit <= 0.0:
+        return 0.0, 0.0
+    return -float(beta) * (delta_v / speed_limit), delta_v
 
 
 def predicted_speed_at_limit_entry(
@@ -42,9 +50,15 @@ def predicted_speed_at_limit_entry(
 
 
 def following_reward(speed_m_s: float, gap_m: float, d_ref_m: float,
-                     previous_gap_m: float, c0: float, c1: float,
-                     c2: float, c3: float, *, gap_valid: bool = True):
-    """Shape following reward using the current gap and per-step gap change."""
+                     c0: float, c1: float, c2: float, c3: float, *,
+                     forward_distance_m: float = 0.0,
+                     current_region_max_speed_m_s: float = 0.0,
+                     gap_valid: bool = True):
+    """Shape following reward using gap bands and speed-referenced progress.
+
+    In the far-gap branch the progress term is ``c3 * distance / speed``;
+    since the inputs use meters and meters per second, that ratio is seconds.
+    """
     # A SUMO sentinel may indicate that the designated lead is no longer in
     # front (or is absent). It is not a physical gap and must not enter the
     # delta-gap branch, where it could create an enormous artificial reward.
@@ -63,8 +77,11 @@ def following_reward(speed_m_s: float, gap_m: float, d_ref_m: float,
     d_ref = float(d_ref_m)
     if d < d_ref:
         return float(c0) - float(c2) * (d - d_max) / (d_ref - d_max)
-    delta_d = float(previous_gap_m) - d
-    return float(c3) * delta_d
+    region_max_speed = max(0.0, float(current_region_max_speed_m_s))
+    if region_max_speed <= 1e-9:
+        return 0.0
+    forward_distance = max(0.0, float(forward_distance_m))
+    return float(c3) * (forward_distance / region_max_speed)
 
 
 def traffic_light_reward(speed_m_s: float, distance_m: float, signal_state,
@@ -86,14 +103,24 @@ def traffic_light_reward(speed_m_s: float, distance_m: float, signal_state,
     if not arrival_time < remaining:
         return 0.0, arrival_time, False
 
-    if isinstance(signal_state, str):
-        state = signal_state.strip().lower()[:1]
-        green = state in ("g",)
-    else:
-        state_value = float(signal_state)
-        green = np.isclose(state_value, 1.0)
+    green = is_green_signal_state(signal_state)
     value = float(c_green) if green else -float(c_non_green)
     return value, arrival_time, True
+
+
+def is_green_signal_state(signal_state):
+    """Return whether a SUMO state string or encoded observation means green."""
+    if isinstance(signal_state, str):
+        return signal_state.strip().lower()[:1] == "g"
+    try:
+        return bool(np.isclose(float(signal_state), 1.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def green_light_crossing_reward(signal_state, crossed: bool, bonus: float = 50.0):
+    """Award a one-time bonus when the vehicle crosses a stop line on green."""
+    return float(bonus) if crossed and is_green_signal_state(signal_state) else 0.0
 
 
 def compute_reward(components: dict, cfg: dict):

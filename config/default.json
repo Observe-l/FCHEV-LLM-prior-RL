@@ -125,7 +125,9 @@
     "speed_limit_entry_deceleration_m_s2": 0.75,
     "speeding_penalty_beta": 100.0,
     "abnormal_termination_penalty": -50.0,
-    "zero_speed_negative_accel_penalty": 0.0
+    "zero_speed_negative_accel_penalty": 0.0,
+    "speed_limit_positive_accel_penalty": 0.0,
+    "speeding_termination_fraction": 0.2
   },
   "training": {
     "algorithm": "hasac",

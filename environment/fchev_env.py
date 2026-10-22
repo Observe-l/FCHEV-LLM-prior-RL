@@ -21,6 +21,7 @@ from util.fcs_model import FCSModel
 from util.reward import (
     compute_reward, following_reward, safety_distance, speeding_reward,
     traffic_light_reward, predicted_speed_at_limit_entry,
+    green_light_crossing_reward,
 )
 from util.vehicle_dynamics import longitudinal_demand
 
@@ -45,6 +46,14 @@ def configured_termination_penalty(reward_config, reason):
             key, reward_config.get("abnormal_termination_penalty", -50.0)
         )
     )
+
+
+def speeding_termination_threshold_m_s(speed_limit_m_s, reward_config):
+    """Return the speed at which exceeding a posted limit terminates an episode."""
+    fraction = max(
+        0.0, float(reward_config.get("speeding_termination_fraction", 0.2))
+    )
+    return float(speed_limit_m_s) * (1.0 + fraction)
 
 
 class FCHEVEnv(gym.Env):
@@ -270,13 +279,17 @@ class FCHEVEnv(gym.Env):
             states, ego, states.get("next_tls")
         )
         if current_limit < self._road_speed_limit_m_s() - 1e-9:
-            # A red-light stop below 30 km/h earns no extra speed-zone reward;
-            # only exceeding the posted 30 km/h limit has positive error.
-            target_limit = current_limit
-            distance = 0.0
-            entry_speed = speed
-            error = max(0.0, (speed - target_limit) / target_limit)
-            mode = "current_zone"
+            # Entry shaping is only for approaching a lower-limit area. Once
+            # inside it, the continuous speeding cost already penalizes excess
+            # speed; rewarding a reduction in normalized excess here can
+            # overpower that cost (for example beta_entry=500 vs beta_speed=100).
+            return {
+                **inactive,
+                "speed_limit_m_s": current_limit,
+                "current_region_speed_limit_m_s": current_limit,
+                "next_region_speed_limit_m_s": next_limit,
+                "mode": "current_zone",
+            }
         elif 0.0 < next_limit < current_limit - 1e-9:
             target_limit = next_limit
             entry_speed, error = predicted_speed_at_limit_entry(
@@ -547,6 +560,24 @@ class FCHEVEnv(gym.Env):
             return self._observation(states_before), 0.0, True, False, {"termination_reason": "ego_not_active"}
         ego0 = states_before["ego"]
         speed_entry_before = self._speed_limit_entry_metrics(states_before)
+        current_speed_limit_for_action, _, _ = self._speed_region_observation(
+            states_before, ego0, states_before.get("next_tls")
+        )
+        zero_speed_negative_accel_action = bool(
+            float(ego0["speed_m_s"]) <= 1e-6 and requested_accel < -1e-9
+        )
+        zero_speed_negative_accel_penalty = (
+            -max(
+                0.0,
+                float(
+                    self.config["reward"].get(
+                        "zero_speed_negative_accel_penalty", 0.0
+                    )
+                ),
+            )
+            if zero_speed_negative_accel_action
+            else 0.0
+        )
         beta_speed_entry = float(
             self.config["reward"]["reward_coefficients"].get("beta_8", 0.0)
         )
@@ -624,6 +655,11 @@ class FCHEVEnv(gym.Env):
         )
         if ego_new_tls_crossing:
             self._ego_passed_tls_ids.add(ego_crossed_tls_id)
+        green_light_crossing_bonus = green_light_crossing_reward(
+            tls.get("state", "") if tls else "",
+            ego_new_tls_crossing,
+            self.config["reward"].get("green_light_crossing_bonus", 0.0),
+        )
         lead1 = states_after.get("lead")
         lead_tls_after = states_after.get("lead_next_tls")
         lead_tls_crossed = self._crossed_traffic_light(
@@ -668,8 +704,8 @@ class FCHEVEnv(gym.Env):
             if lead_speed_zone else road_speed_limit_m_s
         )
         speeding_vehicles = []
-        # Keep an event flag for every posted-limit exceedance. Speeding never
-        # terminates the episode; its continuous cost is applied below.
+        # Keep an event flag for every posted-limit exceedance. The separate
+        # 20% threshold below determines whether the ego speed ends the episode.
         if max(
             float(ego0["speed_m_s"]), float(ego1["speed_m_s"])
         ) > ego_active_speed_limit_m_s + 1e-6:
@@ -683,6 +719,29 @@ class FCHEVEnv(gym.Env):
         # zone, 60 km/h on ordinary roads); the 70 km/h vehicle cap is separate.
         # A red-light stop target is not a zero speed limit throughout approach.
         active_speed_limit_m_s = ego_active_speed_limit_m_s
+        speeding_termination_threshold = speeding_termination_threshold_m_s(
+            active_speed_limit_m_s, self.config["reward"]
+        )
+        speeding_termination_violation = bool(
+            float(ego1["speed_m_s"]) >= speeding_termination_threshold - 1e-9
+        )
+        speed_limit_positive_accel_action = bool(
+            requested_accel > 1e-9
+            and float(ego0["speed_m_s"])
+            >= current_speed_limit_for_action - 1e-6
+        )
+        speed_limit_positive_accel_penalty = (
+            -max(
+                0.0,
+                float(
+                    self.config["reward"].get(
+                        "speed_limit_positive_accel_penalty", 0.0
+                    )
+                ),
+            )
+            if speed_limit_positive_accel_action
+            else 0.0
+        )
         speeding_penalty, speeding_delta_v_m_s = speeding_reward(
             ego1["speed_m_s"], active_speed_limit_m_s, speed_penalty_beta
         )
@@ -731,6 +790,9 @@ class FCHEVEnv(gym.Env):
         )
         following_distance_reduction = (
             previous_gap - gap if front_gap_valid and previous_gap_valid else None
+        )
+        following_forward_distance_m = max(
+            0.0, float(ego1["x_m"]) - float(ego0["x_m"])
         )
         collision = bool(collisions)
         gap_overlap = front_gap_valid and gap <= 0.0
@@ -785,11 +847,12 @@ class FCHEVEnv(gym.Env):
             "following": following_reward(
                 ego1["speed_m_s"], gap,
                 self.config["reward"]["following_d_ref_m"],
-                previous_gap if previous_gap_valid else gap,
                 self.config["reward"]["following_c0"],
                 self.config["reward"]["following_c1"],
                 self.config["reward"]["following_c2"],
                 self.config["reward"]["following_c3"],
+                forward_distance_m=following_forward_distance_m,
+                current_region_max_speed_m_s=ego_active_speed_limit_m_s,
                 gap_valid=front_gap_valid,
             ),
             "following_distance_reduction_m": following_distance_reduction,
@@ -807,6 +870,11 @@ class FCHEVEnv(gym.Env):
         reward_parts["time_to_traffic_light_s"] = time_to_light_s
         reward_parts["traffic_light_reward_active"] = traffic_light_reward_active
         reward += traffic_light_reward_contribution
+        reward_parts["green_light_crossing_bonus"] = green_light_crossing_bonus
+        reward_parts["reward_contribution_green_light_crossing_bonus"] = (
+            green_light_crossing_bonus
+        )
+        reward += green_light_crossing_bonus
         reward_parts["speed_limit_entry"] = speed_entry_delta
         reward_parts["speed_limit_entry_raw_error_delta"] = (
             speed_entry_reward_info["raw_error_delta"]
@@ -817,7 +885,6 @@ class FCHEVEnv(gym.Env):
         reward_parts["beta_speed_limit_entry"] = beta_speed_entry
         reward_parts["reward_contribution_speed_limit_entry"] = speed_entry_reward
         reward += speed_entry_reward
-        zero_speed_negative_accel_penalty = 0.0
         reward_parts["zero_speed_negative_accel_penalty"] = (
             zero_speed_negative_accel_penalty
         )
@@ -825,8 +892,14 @@ class FCHEVEnv(gym.Env):
             zero_speed_negative_accel_penalty
         )
         reward += zero_speed_negative_accel_penalty
+        reward_parts["speed_limit_positive_accel_penalty"] = (
+            speed_limit_positive_accel_penalty
+        )
+        reward_parts["reward_contribution_speed_limit_positive_accel_penalty"] = (
+            speed_limit_positive_accel_penalty
+        )
+        reward += speed_limit_positive_accel_penalty
         collision_penalty = 0.0
-        speed_limit_positive_accel_penalty = 0.0
         p_dc_loss = dispatch["fcs_power_kw"] * 1000.0 * (1.0 - self.config["fcs"]["dc_dc_efficiency"])
         balance_error = edu.electrical_power_w - (
             battery_step.terminal_power_w
@@ -865,6 +938,12 @@ class FCHEVEnv(gym.Env):
         abnormal_termination = False
         if collision_event:
             termination_reason = "collision"
+            abnormal_termination = True
+        elif red_light_violation:
+            termination_reason = "red_light_violation"
+            abnormal_termination = True
+        elif speeding_termination_violation:
+            termination_reason = "speeding"
             abnormal_termination = True
         elif lead_at_terminal_stop:
             termination_reason = "lead_terminal_stop"
@@ -935,12 +1014,16 @@ class FCHEVEnv(gym.Env):
             "lead_acceleration_m_s2": states_after["lead"]["acceleration_m_s2"] if states_after["lead"] else None,
             "following_distance_m": gap,
             "following_distance_reduction_m": following_distance_reduction,
+            "following_forward_distance_m": following_forward_distance_m,
+            "following_region_max_speed_m_s": ego_active_speed_limit_m_s,
             "following_distance_valid": front_gap_valid,
             "collision_count": len(collisions),
             "collision_ids": collisions,
             "collision_event": collision_event,
             "traffic_light_crossing": ego_new_tls_crossing,
             "traffic_light_crossed_id": ego_crossed_tls_id if ego_new_tls_crossing else None,
+            "green_light_crossing": green_light_crossing_bonus > 0.0,
+            "green_light_crossing_bonus": green_light_crossing_bonus,
             "traffic_lights_passed": len(self._ego_passed_tls_ids),
             "lead_traffic_light_crossing": lead_new_tls_crossing,
             "lead_traffic_light_crossed_id": (
@@ -950,6 +1033,8 @@ class FCHEVEnv(gym.Env):
             "red_light_violation": red_light_violation,
             "speeding_violation": speeding_violation,
             "speeding_vehicles": speeding_vehicles,
+            "speeding_termination_violation": speeding_termination_violation,
+            "speeding_termination_threshold_m_s": speeding_termination_threshold,
             "intersection_speed_limit_m_s": intersection_speed_limit_m_s,
             "intersection_speed_zone_enabled": self._intersection_speed_zone_enabled(),
             "active_speed_limit_m_s": active_speed_limit_m_s,
@@ -968,7 +1053,10 @@ class FCHEVEnv(gym.Env):
             "speeding_delta_v_m_s": speeding_delta_v_m_s,
             "speeding_penalty_beta": speed_penalty_beta,
             "speed_limit_positive_accel_penalty": speed_limit_positive_accel_penalty,
+            "speed_limit_positive_accel_action": speed_limit_positive_accel_action,
             "zero_speed_negative_accel_penalty": zero_speed_negative_accel_penalty,
+            "zero_speed_negative_accel_action": zero_speed_negative_accel_action,
+            "current_speed_limit_at_action_m_s": current_speed_limit_for_action,
             "safety_violations": int(safety_violation),
             "constraint_clipping": bool(
                 not np.array_equal(bounded, requested_raw)
