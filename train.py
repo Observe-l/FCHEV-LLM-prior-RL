@@ -481,7 +481,8 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
             elif isinstance(agent, HASAC):
                 driving_state, energy_state = split_agent_observations(obs, vehicle_cfg)
                 driving_action, energy_action = agent.select_actions(
-                    driving_state, energy_state, deterministic=True
+                    driving_state, energy_state, deterministic=True,
+                    full_observation=obs,
                 )
                 physical_action = map_split_actions(
                     driving_action, energy_action, env.action_space
@@ -543,6 +544,10 @@ def main(argv=None):
     parser.add_argument("--evaluation-episodes", type=int, default=None,
                         help="Override periodic evaluation episode count (0 disables evaluations)")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--prior-program-name", default=None,
+        help="Override llm_prior.program_name (the prior must also be enabled in config)",
+    )
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--experiment-name", default=None,
@@ -551,6 +556,8 @@ def main(argv=None):
 
     root = Path(__file__).resolve().parent
     cfg = load_config(root / args.config)
+    if args.prior_program_name is not None:
+        cfg.setdefault("llm_prior", {})["program_name"] = args.prior_program_name
     algorithm_name = (args.algorithm or cfg["training"]["algorithm"]).lower()
     tr = dict(cfg["training"])
     episodes = int(args.episodes if args.episodes is not None else tr["episodes"])
@@ -616,7 +623,12 @@ def main(argv=None):
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
 
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
-    agent = make_agent(algorithm_name, env.observation_space.shape[0], env.action_space.shape[0], tr, seed)
+    agent_config = dict(tr)
+    agent_config["llm_prior"] = dict(cfg.get("llm_prior", {}))
+    agent = make_agent(
+        algorithm_name, env.observation_space.shape[0],
+        env.action_space.shape[0], agent_config, seed,
+    )
     if agent.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(agent.device)
         device_label = f"{torch.cuda.get_device_name(agent.device)} (CUDA)"
@@ -701,7 +713,8 @@ def main(argv=None):
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
                         driving_action_unit, energy_action_unit = agent.select_actions(
-                            driving_state, energy_state, deterministic=False
+                            driving_state, energy_state, deterministic=False,
+                            full_observation=obs,
                         )
                     action_unit = np.asarray(
                         [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32

@@ -32,11 +32,23 @@ class GaussianActor(nn.Module):
 
     def sample(self, state, deterministic=False):
         mean, log_std = self(state)
+        return self.sample_distribution(mean, log_std.exp(), deterministic)
+
+    @staticmethod
+    def sample_distribution(mean, std, deterministic=False, min_std=None):
+        """Sample a tanh-squashed Gaussian from explicit mean/std parameters.
+
+        HASAC uses this entry point after optionally blending actor and prior
+        Gaussian parameters. Keeping the log-probability calculation here
+        ensures SAC's entropy term refers to the distribution that generated
+        the action.
+        """
+        if min_std is not None:
+            std = torch.clamp(std, min=float(min_std))
         if deterministic:
             pre_tanh = mean
             log_prob = None
         else:
-            std = log_std.exp()
             distribution = Normal(mean, std)
             pre_tanh = distribution.rsample()
             log_prob = distribution.log_prob(pre_tanh).sum(dim=-1, keepdim=True)

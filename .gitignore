@@ -6,6 +6,8 @@ codegen/
 Battery_Electrothermal_Model/
 papers/
 __pycache__/
+.pytest_cache/
+.vscode/
 
 
 *.slxc
