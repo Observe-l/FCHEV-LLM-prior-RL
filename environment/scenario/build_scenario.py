@@ -159,6 +159,13 @@ def build_scenario(project_root: Path, sumo_cfg: dict, vehicle_cfg: dict,
         common, id="leadType", maxSpeed=f"{vehicle_max_speed:.6f}",
         speedFactor=f"{sumo_cfg['lead_target_speed_mps'] / road_speed_limit:.8f}",
     )
+    # The lead is an IDM-controlled SUMO vehicle, so both its comfortable and
+    # emergency braking limits must match the strongest deceleration the ego
+    # policy can request. Otherwise SUMO may let the lead brake at the much
+    # larger vehicle emergencyDecel value while the ego is limited to -1.5 m/s^2.
+    lead_max_decel = abs(float(vehicle_cfg["min_action_acceleration_m_s2"]))
+    lead_attrs["decel"] = f"{lead_max_decel:.6f}"
+    lead_attrs["emergencyDecel"] = f"{lead_max_decel:.6f}"
     ego_attrs = dict(common, id="egoType", maxSpeed=f"{vehicle_max_speed:.6f}")
     ET.SubElement(routes, "vType", lead_attrs)
     ET.SubElement(routes, "vType", ego_attrs)

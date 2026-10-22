@@ -583,6 +583,21 @@ class SumoIntegrationTests(unittest.TestCase):
                 ROOT, sumo_cfg, config["vehicle"], output_dir=scenario_dir
             )
             signals = ET.parse(Path(scenario_cfg).parent / "signals.tll.xml").getroot()
+            route_types = {
+                vehicle_type.attrib["id"]: vehicle_type.attrib
+                for vehicle_type in ET.parse(
+                    Path(scenario_cfg).parent / "vehicles.rou.xml"
+                ).getroot().findall("vType")
+            }
+        lead_max_decel = abs(config["vehicle"]["min_action_acceleration_m_s2"])
+        self.assertAlmostEqual(float(route_types["leadType"]["decel"]), lead_max_decel)
+        self.assertAlmostEqual(
+            float(route_types["leadType"]["emergencyDecel"]), lead_max_decel
+        )
+        self.assertAlmostEqual(
+            float(route_types["egoType"]["emergencyDecel"]),
+            config["vehicle"]["emergency_deceleration_m_s2"],
+        )
         phase_durations = {
             tuple(int(float(phase.attrib["duration"])) for phase in logic.findall("phase"))
             for logic in signals.findall("tlLogic")
