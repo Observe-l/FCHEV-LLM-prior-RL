@@ -185,14 +185,15 @@ class HASAC:
 
     @torch.no_grad()
     def select_actions(self, driving_state, energy_state, deterministic=False,
-                       full_observation=None):
+                       full_observation=None, prior_output=None):
         driving_tensor = torch.as_tensor(
             np.asarray(driving_state, dtype=np.float32), device=self.device
         ).reshape(1, -1)
         energy_tensor = torch.as_tensor(
             np.asarray(energy_state, dtype=np.float32), device=self.device
         ).reshape(1, -1)
-        prior_output = self._predict_prior(full_observation, batch_size=1)
+        if prior_output is None:
+            prior_output = self._predict_prior(full_observation, batch_size=1)
         driving_action, _ = self._sample_actor(
             self.driving_actor, driving_tensor, "driving", full_observation,
             deterministic=deterministic,

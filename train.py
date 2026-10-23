@@ -25,6 +25,17 @@ from util.observation import normalize_observation
 
 TRACE_FIELDS = [
     "time_s", "reward", "driving_agent_reward", "energy_agent_reward",
+    # Raw pre-action observation and the exact Gaussian prior used at this
+    # step. These columns make stale full_observation bugs visible in traces.
+    "policy_obs_soc", "policy_obs_battery_soh", "policy_obs_fcs_soh",
+    "policy_obs_edu_soh", "policy_obs_ego_acceleration_m_s2",
+    "policy_obs_ego_speed_m_s", "policy_obs_lead_acceleration_m_s2",
+    "policy_obs_lead_speed_m_s", "policy_obs_following_distance_m",
+    "policy_obs_next_signal_state", "policy_obs_next_signal_distance_m",
+    "policy_obs_signal_phase_remaining_s", "policy_obs_current_speed_limit_m_s",
+    "policy_obs_next_speed_limit_m_s", "policy_obs_distance_to_next_speed_region_m",
+    "policy_driving_prior_mean", "policy_driving_prior_std", "policy_driving_prior_active",
+    "policy_energy_prior_mean", "policy_energy_prior_std", "policy_energy_prior_active",
     "energy_agent_observed_executed_acceleration_m_s2",
     "soc", "battery_soh", "fcs_soh", "edu_soh",
     "core_temperature_c", "surface_temperature_c", "ego_speed_m_s",
@@ -687,6 +698,11 @@ def main(argv=None):
             updates = []
             local_step = 0
             while True:
+                # Keep the exact raw state passed to the prior for the trace.
+                # HASAC's actor states below are normalized/split views, while
+                # the prior contract consumes the complete raw observation.
+                policy_observation = np.asarray(obs, dtype=np.float32).copy()
+                prior_output = None
                 energy_observed_acceleration = (
                     float(energy_state[0]) if is_dual_policy_agent(agent) else None
                 )
@@ -712,9 +728,11 @@ def main(argv=None):
                         driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
+                        if agent.prior_provider is not None:
+                            prior_output = agent._predict_prior(obs, batch_size=1)
                         driving_action_unit, energy_action_unit = agent.select_actions(
                             driving_state, energy_state, deterministic=False,
-                            full_observation=obs,
+                            full_observation=obs, prior_output=prior_output,
                         )
                     action_unit = np.asarray(
                         [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
@@ -769,6 +787,10 @@ def main(argv=None):
                 else:
                     agent.replay.add(state, action_unit, reward, next_state, done)
                 state = next_state
+                # Keep the raw full observation synchronized with the split
+                # actor states. Without this assignment, prior-enabled runs
+                # repeatedly condition on the episode's reset observation.
+                obs = next_obs
                 total_return += reward
                 total_hydrogen += info.get("hydrogen_consumed_g", 0.0)
                 total_safety_violations += info.get("safety_violations", 0)
@@ -798,6 +820,45 @@ def main(argv=None):
                     "time_s": info.get("sumo_time_s"), "reward": reward,
                     "driving_agent_reward": driving_reward if is_dual_policy_agent(agent) else None,
                     "energy_agent_reward": energy_reward if is_dual_policy_agent(agent) else None,
+                    **{
+                        f"policy_obs_{name}": float(value)
+                        for name, value in zip(
+                            (
+                                "soc", "battery_soh", "fcs_soh", "edu_soh",
+                                "ego_acceleration_m_s2", "ego_speed_m_s",
+                                "lead_acceleration_m_s2", "lead_speed_m_s",
+                                "following_distance_m", "next_signal_state",
+                                "next_signal_distance_m", "signal_phase_remaining_s",
+                                "current_speed_limit_m_s", "next_speed_limit_m_s",
+                                "distance_to_next_speed_region_m",
+                            ),
+                            policy_observation,
+                        )
+                    },
+                    "policy_driving_prior_mean": (
+                        float(prior_output.driving.mean[0, 0])
+                        if prior_output is not None else None
+                    ),
+                    "policy_driving_prior_std": (
+                        float(prior_output.driving.std[0, 0])
+                        if prior_output is not None else None
+                    ),
+                    "policy_driving_prior_active": (
+                        int(prior_output.driving.active[0, 0])
+                        if prior_output is not None else None
+                    ),
+                    "policy_energy_prior_mean": (
+                        float(prior_output.energy.mean[0, 0])
+                        if prior_output is not None else None
+                    ),
+                    "policy_energy_prior_std": (
+                        float(prior_output.energy.std[0, 0])
+                        if prior_output is not None else None
+                    ),
+                    "policy_energy_prior_active": (
+                        int(prior_output.energy.active[0, 0])
+                        if prior_output is not None else None
+                    ),
                     "energy_agent_observed_executed_acceleration_m_s2": energy_observed_acceleration,
                     "soc": info.get("battery_soc"), "battery_soh": info.get("battery_soh"),
                     "fcs_soh": info.get("fcs_soh"), "edu_soh": info.get("edu_soh"),
