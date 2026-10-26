@@ -35,8 +35,13 @@ TRACE_FIELDS = [
     "policy_obs_signal_phase_remaining_s", "policy_obs_current_speed_limit_m_s",
     "policy_obs_next_speed_limit_m_s", "policy_obs_distance_to_next_speed_region_m",
     "policy_driving_prior_mean", "policy_driving_prior_std", "policy_driving_prior_active",
+    "policy_driving_prior_lambda_0", "policy_driving_prior_lambda_1",
     "policy_energy_prior_mean", "policy_energy_prior_std", "policy_energy_prior_active",
+    "policy_energy_prior_lambda_0", "policy_energy_prior_lambda_1",
     "energy_agent_observed_executed_acceleration_m_s2",
+    "energy_agent_observation_ego_speed_m_s",
+    "energy_agent_observation_soc", "energy_agent_observation_battery_soh",
+    "energy_agent_observation_fcs_soh", "energy_agent_observation_edu_soh",
     "soc", "battery_soh", "fcs_soh", "edu_soh",
     "core_temperature_c", "surface_temperature_c", "ego_speed_m_s",
     "ego_acceleration_m_s2", "lead_speed_m_s", "lead_acceleration_m_s2",
@@ -125,7 +130,7 @@ REWARD_BETA_COMPONENTS = (
     "traffic_light", "speeding", "speed_limit_entry",
 )
 DRIVING_OBSERVATION_INDICES = (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
-ENERGY_OBSERVATION_INDICES = (0, 1, 2, 3)
+ENERGY_OBSERVATION_INDICES = (4, 5, 0, 1, 2, 3)
 
 
 def seed_everything(seed):
@@ -174,14 +179,16 @@ def map_split_actions(driving_action_unit, energy_action_unit, action_space):
 
 
 def split_agent_observations(observation, vehicle_cfg):
-    """Build driving and energy observations from the shared environment state."""
+    """Build physical-unit driving and energy views of the shared state.
+
+    Energy order: measured ego acceleration, ego speed, SOC, battery SOH,
+    FCS SOH, and EDU SOH.
+    """
     state = normalize_observation(observation, vehicle_cfg)
     driving_state = state[np.asarray(DRIVING_OBSERVATION_INDICES, dtype=np.int64)].copy()
     # The energy agent observes the measured acceleration present at this
     # decision point, not the driving policy's unexecuted request.
-    energy_state = np.asarray(
-        [state[4], state[0], state[1], state[2], state[3]], dtype=np.float32
-    )
+    energy_state = state[np.asarray(ENERGY_OBSERVATION_INDICES, dtype=np.int64)].copy()
     return driving_state, energy_state
 
 
@@ -207,6 +214,38 @@ def split_agent_rewards(info):
 
 def is_dual_policy_agent(agent):
     return isinstance(agent, (TwoAgentSAC, HASAC))
+
+
+def _apply_hasac_prior_lambda_schedule(agent, schedule, episode):
+    """Apply an optional episode-indexed per-agent Gaussian-prior schedule."""
+    if not isinstance(agent, HASAC) or not schedule:
+        return None
+    if not isinstance(schedule, list):
+        raise TypeError("training.prior_lambda_schedule must be a list")
+    for phase in schedule:
+        start = int(phase.get("episode_start", 1))
+        end = int(phase.get("episode_end", start))
+        if start <= episode <= end:
+            lambda_by_agent = phase.get("lambda_by_agent")
+            if not isinstance(lambda_by_agent, dict):
+                raise TypeError(
+                    "Each prior lambda schedule phase must define lambda_by_agent"
+                )
+            for name in ("driving", "energy"):
+                values = lambda_by_agent.get(name)
+                if not isinstance(values, dict):
+                    raise TypeError(
+                        f"prior lambda schedule phase must define {name} lambdas"
+                    )
+                for key in ("lambda_0", "lambda_1"):
+                    value = float(values[key])
+                    if not 0.0 <= value <= 1.0:
+                        raise ValueError(
+                            f"{name}.{key} in prior lambda schedule must be in [0, 1]"
+                        )
+            agent.prior_cfg["lambda_by_agent"] = lambda_by_agent
+            return phase
+    return None
 
 
 def make_agent(name, obs_dim, action_dim, config, seed):
@@ -559,6 +598,10 @@ def main(argv=None):
         "--prior-program-name", default=None,
         help="Override llm_prior.program_name (the prior must also be enabled in config)",
     )
+    parser.add_argument(
+        "--resume-checkpoint", default=None,
+        help="Resume HASAC actor/critic/optimizer weights; replay data is recollected",
+    )
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--experiment-name", default=None,
@@ -570,6 +613,19 @@ def main(argv=None):
     if args.prior_program_name is not None:
         cfg.setdefault("llm_prior", {})["program_name"] = args.prior_program_name
     algorithm_name = (args.algorithm or cfg["training"]["algorithm"]).lower()
+    resume_checkpoint = None
+    if args.resume_checkpoint is not None:
+        resume_checkpoint = Path(args.resume_checkpoint)
+        if not resume_checkpoint.is_absolute():
+            resume_checkpoint = root / resume_checkpoint
+        resume_checkpoint = resume_checkpoint.resolve()
+        if not resume_checkpoint.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint}")
+        if algorithm_name != "hasac":
+            raise ValueError("--resume-checkpoint currently supports HASAC only")
+        cfg["training"]["resume_checkpoint"] = str(resume_checkpoint)
+        cfg["training"]["resume_replay_buffer"] = False
+    resumed_from_checkpoint = resume_checkpoint is not None
     tr = dict(cfg["training"])
     episodes = int(args.episodes if args.episodes is not None else tr["episodes"])
     seed = int(args.seed if args.seed is not None else cfg["seed"])
@@ -585,6 +641,12 @@ def main(argv=None):
     tr["episodes"] = episodes
     tr["learning_starts"] = learning_starts
     tr["batch_size"] = batch_size
+    tr["actor_hidden_activation"] = "LeakyReLU(negative_slope=0.01)"
+    tr["critic_hidden_activation"] = "ReLU"
+    tr["energy_observation_features"] = [
+        "ego_acceleration_m_s2", "ego_speed_m_s", "soc", "battery_soh",
+        "fcs_soh", "edu_soh",
+    ]
     if args.gamma is not None:
         tr["gamma"] = float(args.gamma)
     cfg["training"].update(tr)
@@ -603,6 +665,12 @@ def main(argv=None):
         run_name = f"{algorithm_name}_{experiment_label}_{stamp}_seed{seed}"
     run_dir = (root / args.output_root / run_name).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
+    # Keep the requested singular filename available while preserving the
+    # established losses.csv name without duplicating a potentially large log.
+    try:
+        (run_dir / "loss.csv").symlink_to("losses.csv")
+    except OSError:
+        pass
     # Every process owns its SUMO XML and network files. This prevents concurrent
     # ablation/evaluation runs from overwriting one another's generated scenario.
     cfg["sumo"]["scenario_output_dir"] = str(run_dir / "scenario")
@@ -640,6 +708,28 @@ def main(argv=None):
         algorithm_name, env.observation_space.shape[0],
         env.action_space.shape[0], agent_config, seed,
     )
+    if resumed_from_checkpoint:
+        if not isinstance(agent, HASAC):
+            raise TypeError("HASAC checkpoint loading requires a HASAC agent")
+        requested_prior_cfg = dict(cfg.get("llm_prior", {}))
+        agent.load(resume_checkpoint, load_optimizers=True)
+        # The source checkpoint may have been trained without a prior. Restore
+        # this run's requested prior after loading the network/optimizer state.
+        agent.prior_cfg = requested_prior_cfg
+        agent.lambda_mean = float(requested_prior_cfg.get("lambda_0", 0.5))
+        agent.lambda_std = float(requested_prior_cfg.get("lambda_1", 0.5))
+        if not 0.0 <= agent.lambda_mean <= 1.0:
+            raise ValueError("llm_prior.lambda_0 must be in [0, 1]")
+        if not 0.0 <= agent.lambda_std <= 1.0:
+            raise ValueError("llm_prior.lambda_1 must be in [0, 1]")
+        agent.prior_provider = agent._build_prior_provider()
+        if agent.prior_provider is None:
+            raise ValueError(
+                "Resume config must enable an llm_prior program when adding a prior"
+            )
+        # Preserve the new run's configured discount factor. The checkpoint's
+        # model and optimizer states are restored; its replay is not serialized.
+        agent.gamma = float(tr["gamma"])
     if agent.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(agent.device)
         device_label = f"{torch.cuda.get_device_name(agent.device)} (CUDA)"
@@ -672,6 +762,15 @@ def main(argv=None):
     start_time = time.perf_counter()
     try:
         for episode in range(1, episodes + 1):
+            prior_schedule_phase = _apply_hasac_prior_lambda_schedule(
+                agent, tr.get("prior_lambda_schedule"), episode
+            )
+            if isinstance(agent, HASAC):
+                driving_lambda_0, driving_lambda_1 = agent._agent_lambda_weights("driving")
+                energy_lambda_0, energy_lambda_1 = agent._agent_lambda_weights("energy")
+            else:
+                driving_lambda_0 = driving_lambda_1 = None
+                energy_lambda_0 = energy_lambda_1 = None
             # Keep the exogenous SUMO scenario identical across episodes.
             # Policy exploration and network updates remain stochastic, but
             # signals and the lead-vehicle stop plan use the same scene seed.
@@ -707,7 +806,7 @@ def main(argv=None):
                     float(energy_state[0]) if is_dual_policy_agent(agent) else None
                 )
                 if isinstance(agent, TwoAgentSAC):
-                    if global_step < learning_starts:
+                    if global_step < learning_starts and not resumed_from_checkpoint:
                         driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
@@ -724,7 +823,7 @@ def main(argv=None):
                         driving_action_unit, energy_action_unit, env.action_space
                     )
                 elif isinstance(agent, HASAC):
-                    if global_step < learning_starts:
+                    if global_step < learning_starts and not resumed_from_checkpoint:
                         driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
@@ -741,7 +840,7 @@ def main(argv=None):
                         driving_action_unit, energy_action_unit, env.action_space
                     )
                 else:
-                    if global_step < learning_starts:
+                    if global_step < learning_starts and not resumed_from_checkpoint:
                         action_unit = np.random.uniform(-1.0, 1.0, size=env.action_space.shape[0]).astype(np.float32)
                     else:
                         action_unit = agent.select_action(state, deterministic=False)
@@ -847,6 +946,14 @@ def main(argv=None):
                         int(prior_output.driving.active[0, 0])
                         if prior_output is not None else None
                     ),
+                    "policy_driving_prior_lambda_0": (
+                        agent._agent_lambda_weights("driving")[0]
+                        if isinstance(agent, HASAC) and prior_output is not None else None
+                    ),
+                    "policy_driving_prior_lambda_1": (
+                        agent._agent_lambda_weights("driving")[1]
+                        if isinstance(agent, HASAC) and prior_output is not None else None
+                    ),
                     "policy_energy_prior_mean": (
                         float(prior_output.energy.mean[0, 0])
                         if prior_output is not None else None
@@ -859,7 +966,30 @@ def main(argv=None):
                         int(prior_output.energy.active[0, 0])
                         if prior_output is not None else None
                     ),
+                    "policy_energy_prior_lambda_0": (
+                        agent._agent_lambda_weights("energy")[0]
+                        if isinstance(agent, HASAC) and prior_output is not None else None
+                    ),
+                    "policy_energy_prior_lambda_1": (
+                        agent._agent_lambda_weights("energy")[1]
+                        if isinstance(agent, HASAC) and prior_output is not None else None
+                    ),
                     "energy_agent_observed_executed_acceleration_m_s2": energy_observed_acceleration,
+                    "energy_agent_observation_ego_speed_m_s": (
+                        float(energy_state[1]) if is_dual_policy_agent(agent) else None
+                    ),
+                    "energy_agent_observation_soc": (
+                        float(energy_state[2]) if is_dual_policy_agent(agent) else None
+                    ),
+                    "energy_agent_observation_battery_soh": (
+                        float(energy_state[3]) if is_dual_policy_agent(agent) else None
+                    ),
+                    "energy_agent_observation_fcs_soh": (
+                        float(energy_state[4]) if is_dual_policy_agent(agent) else None
+                    ),
+                    "energy_agent_observation_edu_soh": (
+                        float(energy_state[5]) if is_dual_policy_agent(agent) else None
+                    ),
                     "soc": info.get("battery_soc"), "battery_soh": info.get("battery_soh"),
                     "fcs_soh": info.get("fcs_soh"), "edu_soh": info.get("edu_soh"),
                     "core_temperature_c": info.get("battery_core_temperature_c"),
@@ -1036,17 +1166,32 @@ def main(argv=None):
                 else:
                     subagents = {"joint": agent}
                 for subagent_name, subagent in subagents.items():
-                    if len(subagent.replay) >= batch_size and global_step >= learning_starts:
+                    if len(subagent.replay) >= batch_size and (
+                        global_step >= learning_starts or resumed_from_checkpoint
+                    ):
                         for _ in range(int(tr.get("updates_per_step", 1))):
                             losses = subagent.update(batch_size)
                             losses["agent"] = subagent_name
                             losses["global_step"] = global_step
+                            if isinstance(agent, HASAC):
+                                for name in ("driving", "energy"):
+                                    lambda_0, lambda_1 = agent._agent_lambda_weights(name)
+                                    losses[f"{name}_prior_lambda_0"] = lambda_0
+                                    losses[f"{name}_prior_lambda_1"] = lambda_1
                             updates.append(losses)
                 if terminated or truncated or (args.max_steps is not None and local_step >= args.max_steps):
                     break
             _write_csv(run_dir / f"episode_{episode:04d}_trajectory.csv", trace, TRACE_FIELDS)
             row = {
                 "episode": episode, "seed": seed,
+                "prior_schedule_phase": (
+                    prior_schedule_phase.get("name")
+                    if prior_schedule_phase else None
+                ),
+                "driving_prior_lambda_0": driving_lambda_0,
+                "driving_prior_lambda_1": driving_lambda_1,
+                "energy_prior_lambda_0": energy_lambda_0,
+                "energy_prior_lambda_1": energy_lambda_1,
                 "return": total_return, "penalty_magnitude": -total_return,
                 "driving_agent_return": total_driving_return if is_dual_policy_agent(agent) else None,
                 "energy_agent_return": total_energy_return if is_dual_policy_agent(agent) else None,
@@ -1082,7 +1227,29 @@ def main(argv=None):
             _append_csv(run_dir / "episodes.csv", [row], list(row))
             loss_fields = [
                 "agent", "global_step", "critic_loss", "actor_loss",
+                "driving_prior_lambda_0", "driving_prior_lambda_1",
+                "energy_prior_lambda_0", "energy_prior_lambda_1",
                 "driving_actor_loss", "energy_actor_loss", "alpha_loss", "alpha",
+                "critic_q1_replay_mean", "critic_q2_replay_mean",
+                "critic_target_mean", "critic_target_state_std",
+                "driving_q_policy", "driving_q1_policy", "driving_q2_policy",
+                "driving_log_prob", "driving_entropy", "driving_entropy_term",
+                "driving_negative_q_term", "driving_raw_mean",
+                "driving_raw_mean_state_std", "driving_raw_std",
+                "driving_raw_std_state_std", "driving_fused_mean",
+                "driving_fused_mean_state_std", "driving_fused_std",
+                "driving_fused_std_state_std", "driving_sampled_action",
+                "driving_sampled_action_state_std", "driving_actor_grad_norm",
+                "driving_actor_hidden_grad_norm", "driving_actor_output_grad_norm",
+                "energy_q_policy", "energy_q1_policy", "energy_q2_policy",
+                "energy_log_prob", "energy_entropy", "energy_entropy_term",
+                "energy_negative_q_term", "energy_raw_mean",
+                "energy_raw_mean_state_std", "energy_raw_std",
+                "energy_raw_std_state_std", "energy_fused_mean",
+                "energy_fused_mean_state_std", "energy_fused_std",
+                "energy_fused_std_state_std", "energy_sampled_action",
+                "energy_sampled_action_state_std", "energy_actor_grad_norm",
+                "energy_actor_hidden_grad_norm", "energy_actor_output_grad_norm",
             ]
             if updates:
                 _append_csv(run_dir / "losses.csv", updates, loss_fields)
@@ -1187,8 +1354,11 @@ def main(argv=None):
             if isinstance(agent, TwoAgentSAC) else "single_agent"
         ),
         "agent_observation_dimensions": (
+            {"driving": agent.driving_state_dim, "energy": agent.energy_state_dim}
+            if isinstance(agent, HASAC) else
             {"driving": 11, "energy": 5}
-            if is_dual_policy_agent(agent) else {"joint": env.observation_space.shape[0]}
+            if isinstance(agent, TwoAgentSAC) else
+            {"joint": env.observation_space.shape[0]}
         ),
         "hasac_entropy_temperature": agent.alpha if isinstance(agent, HASAC) else None,
         "hasac_shared_reward_definition": (

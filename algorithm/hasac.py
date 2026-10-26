@@ -25,7 +25,18 @@ class HASAC:
 
     checkpoint_algorithm = "hasac"
     driving_state_dim = 11
-    energy_state_dim = 5
+    energy_state_dim = 6
+    driving_state_features = (
+        "ego_acceleration_m_s2", "ego_speed_m_s", "lead_acceleration_m_s2",
+        "lead_speed_m_s", "following_distance_m", "next_signal_state_normalized",
+        "next_signal_distance_m", "signal_phase_remaining_s",
+        "current_speed_limit_m_s", "next_speed_limit_m_s",
+        "distance_to_next_speed_region_m",
+    )
+    energy_state_features = (
+        "ego_acceleration_m_s2", "ego_speed_m_s", "soc", "battery_soh",
+        "fcs_soh", "edu_soh",
+    )
     action_dim_per_agent = 1
 
     def __init__(self, config, seed=0, prior_provider=None):
@@ -120,9 +131,11 @@ class HASAC:
         """Reconstruct the raw 15-state observation from the replay layout."""
         driving = joint_state[..., :HASAC.driving_state_dim]
         energy = joint_state[..., HASAC.driving_state_dim:]
-        # split_agent_observations stores normalized [signal state / 2] in the
-        # driving view. Restore the raw categorical value for the prior API.
-        full = torch.cat((energy[..., 1:5], driving), dim=-1).clone()
+        # Energy layout is [ego acceleration, ego speed, SOC, battery SOH,
+        # FCS SOH, EDU SOH]. The first four environment observations are
+        # reconstructed from columns 2:6; the driving view starts at index 4.
+        # Restore the raw traffic-light category for the prior API.
+        full = torch.cat((energy[..., 2:6], driving), dim=-1).clone()
         full[..., 9] = 2.0 * full[..., 9]
         return full
 
@@ -149,29 +162,78 @@ class HASAC:
             prior_output, batch_size=full_numpy.shape[0]
         )
 
+    def _agent_lambda_weights(self, agent_name):
+        """Return this actor's (mean, std) prior-mixing weights.
+
+        ``lambda_by_agent`` permits independent driving/energy prior strengths.
+        Each entry may specify ``lambda_0`` (pre-tanh mean) and ``lambda_1``
+        (std), falling back to the legacy global weights when omitted.
+        """
+        overrides = self.prior_cfg.get("lambda_by_agent", {})
+        agent_override = overrides.get(agent_name, {}) if isinstance(overrides, dict) else {}
+        if isinstance(agent_override, (int, float)):
+            lambda_mean = lambda_std = float(agent_override)
+        elif isinstance(agent_override, dict):
+            lambda_mean = float(agent_override.get("lambda_0", self.lambda_mean))
+            lambda_std = float(agent_override.get("lambda_1", self.lambda_std))
+        else:
+            raise TypeError(
+                f"llm_prior.lambda_by_agent.{agent_name} must be a number or mapping"
+            )
+        if not 0.0 <= lambda_mean <= 1.0:
+            raise ValueError(
+                f"llm_prior.lambda_by_agent.{agent_name}.lambda_0 must be in [0, 1]"
+            )
+        if not 0.0 <= lambda_std <= 1.0:
+            raise ValueError(
+                f"llm_prior.lambda_by_agent.{agent_name}.lambda_1 must be in [0, 1]"
+            )
+        return lambda_mean, lambda_std
+
     def _policy_parameters(self, actor, state, agent_name, full_observation,
                            prior_output=None):
-        mean, log_std = actor(state)
-        std = log_std.exp()
+        parameters = self._policy_parameter_details(
+            actor, state, agent_name, full_observation, prior_output
+        )
+        return parameters["mean"], parameters["std"]
+
+    def _policy_parameter_details(self, actor, state, agent_name, full_observation,
+                                  prior_output=None):
+        raw_mean, log_std = actor(state)
+        raw_std = log_std.exp()
+        mean, std = raw_mean, raw_std
+        prior_mean, prior_std = raw_mean, raw_std
+        active = torch.zeros_like(raw_mean)
         if self.prior_provider is None:
-            return mean, std
+            return {
+                "mean": mean, "std": std,
+                "raw_mean": raw_mean, "raw_std": raw_std,
+                "prior_mean": prior_mean, "prior_std": prior_std,
+                "prior_active": active,
+            }
         if prior_output is None:
             prior_output = self._predict_prior(full_observation, state.shape[0])
         prior = prior_output.for_agent(agent_name)
         prior_mean = torch.as_tensor(
-            prior.mean, dtype=mean.dtype, device=mean.device
+            prior.mean, dtype=raw_mean.dtype, device=raw_mean.device
         )
         prior_std = torch.as_tensor(
-            prior.std, dtype=std.dtype, device=std.device
+            prior.std, dtype=raw_std.dtype, device=raw_std.device
         )
         active = torch.as_tensor(
-            prior.active, dtype=mean.dtype, device=mean.device
+            prior.active, dtype=raw_mean.dtype, device=raw_mean.device
         )
-        mean_weight = active * self.lambda_mean
-        std_weight = active * self.lambda_std
-        fused_mean = (1.0 - mean_weight) * mean + mean_weight * prior_mean
-        fused_std = (1.0 - std_weight) * std + std_weight * prior_std
-        return fused_mean, fused_std
+        lambda_mean, lambda_std = self._agent_lambda_weights(agent_name)
+        mean_weight = active * lambda_mean
+        std_weight = active * lambda_std
+        mean = (1.0 - mean_weight) * raw_mean + mean_weight * prior_mean
+        std = (1.0 - std_weight) * raw_std + std_weight * prior_std
+        return {
+            "mean": mean, "std": std,
+            "raw_mean": raw_mean, "raw_std": raw_std,
+            "prior_mean": prior_mean, "prior_std": prior_std,
+            "prior_active": active,
+        }
 
     def _sample_actor(self, actor, state, agent_name, full_observation,
                       deterministic=False, prior_output=None):
@@ -272,18 +334,27 @@ class HASAC:
         self.critic_opt.step()
 
         actor_losses = {}
+        actor_diagnostics = {}
         order = self._permutation_rng.permutation(2)
         critic_parameters = list(self.q1.parameters()) + list(self.q2.parameters())
         for agent_index in order:
             # Re-sample both policies at each sequential improvement step. The
             # other agent's sampled action is held fixed for this actor update.
-            driving_action, driving_logp = self._sample_actor(
+            driving_parameters = self._policy_parameter_details(
                 self.driving_actor, driving_state, "driving",
                 current_full_observation, prior_output=current_prior,
             )
-            energy_action, energy_logp = self._sample_actor(
+            energy_parameters = self._policy_parameter_details(
                 self.energy_actor, energy_state, "energy",
                 current_full_observation, prior_output=current_prior,
+            )
+            driving_action, driving_logp = GaussianActor.sample_distribution(
+                driving_parameters["mean"], driving_parameters["std"],
+                min_std=1e-6 if self.prior_provider is not None else None,
+            )
+            energy_action, energy_logp = GaussianActor.sample_distribution(
+                energy_parameters["mean"], energy_parameters["std"],
+                min_std=1e-6 if self.prior_provider is not None else None,
             )
             joint_policy_action = torch.cat((driving_action, energy_action), dim=-1)
             if agent_index == 0:
@@ -294,6 +365,8 @@ class HASAC:
                 actor = self.driving_actor
                 optimizer = self.driving_actor_opt
                 name = "driving"
+                own_action = driving_action
+                own_parameters = driving_parameters
             else:
                 joint_policy_action = torch.cat(
                     (driving_action.detach(), energy_action), dim=-1
@@ -302,33 +375,89 @@ class HASAC:
                 actor = self.energy_actor
                 optimizer = self.energy_actor_opt
                 name = "energy"
+                own_action = energy_action
+                own_parameters = energy_parameters
 
             for parameter in critic_parameters:
                 parameter.requires_grad_(False)
-            q_policy = torch.minimum(
-                self.q1(joint_state, joint_policy_action),
-                self.q2(joint_state, joint_policy_action),
-            )
+            q1_policy = self.q1(joint_state, joint_policy_action)
+            q2_policy = self.q2(joint_state, joint_policy_action)
+            q_policy = torch.minimum(q1_policy, q2_policy)
             actor_loss = (self.alpha * own_logp - q_policy).mean()
             optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
+            linear_layers = [
+                module for module in actor.modules() if isinstance(module, nn.Linear)
+            ]
+            hidden_parameters = [
+                parameter for layer in linear_layers[:-1]
+                for parameter in layer.parameters()
+            ]
+            output_parameters = list(linear_layers[-1].parameters())
+            hidden_grad_norm = self._gradient_l2_norm(hidden_parameters)
+            output_grad_norm = self._gradient_l2_norm(output_parameters)
+            actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
             optimizer.step()
             for parameter in critic_parameters:
                 parameter.requires_grad_(True)
-            actor_losses[name] = float(actor_loss.detach().cpu())
+            actor_losses[name] = actor_loss.detach()
+            actor_diagnostics[name] = {
+                f"{name}_q_policy": q_policy.detach().mean(),
+                f"{name}_q1_policy": q1_policy.detach().mean(),
+                f"{name}_q2_policy": q2_policy.detach().mean(),
+                f"{name}_log_prob": own_logp.detach().mean(),
+                f"{name}_entropy": (-own_logp.detach()).mean(),
+                f"{name}_entropy_term": (self.alpha * own_logp.detach()).mean(),
+                f"{name}_negative_q_term": (-q_policy.detach()).mean(),
+                f"{name}_raw_mean": own_parameters["raw_mean"].detach().mean(),
+                f"{name}_raw_mean_state_std": own_parameters["raw_mean"].detach().std(unbiased=False),
+                f"{name}_raw_std": own_parameters["raw_std"].detach().mean(),
+                f"{name}_raw_std_state_std": own_parameters["raw_std"].detach().std(unbiased=False),
+                f"{name}_fused_mean": own_parameters["mean"].detach().mean(),
+                f"{name}_fused_mean_state_std": own_parameters["mean"].detach().std(unbiased=False),
+                f"{name}_fused_std": own_parameters["std"].detach().mean(),
+                f"{name}_fused_std_state_std": own_parameters["std"].detach().std(unbiased=False),
+                f"{name}_sampled_action": own_action.detach().mean(),
+                f"{name}_sampled_action_state_std": own_action.detach().std(unbiased=False),
+                f"{name}_actor_grad_norm": torch.as_tensor(actor_grad_norm).detach(),
+                f"{name}_actor_hidden_grad_norm": hidden_grad_norm,
+                f"{name}_actor_output_grad_norm": output_grad_norm,
+            }
 
         self._soft_update(self.q1, self.target_q1)
         self._soft_update(self.q2, self.target_q2)
         self.update_count += 1
-        return {
-            "critic_loss": float(critic_loss.detach().cpu()),
-            "actor_loss": float(np.mean(list(actor_losses.values()))),
+        result_tensors = {
+            "critic_loss": critic_loss.detach(),
+            "critic_q1_replay_mean": q1.detach().mean(),
+            "critic_q2_replay_mean": q2.detach().mean(),
+            "critic_target_mean": target.detach().mean(),
+            "critic_target_state_std": target.detach().std(unbiased=False),
+            "actor_loss": torch.stack(list(actor_losses.values())).mean(),
             "driving_actor_loss": actor_losses["driving"],
             "energy_actor_loss": actor_losses["energy"],
-            "alpha_loss": 0.0,
-            "alpha": self.alpha,
+            "alpha_loss": critic_loss.new_zeros(()),
+            "alpha": critic_loss.new_tensor(self.alpha),
         }
+        for diagnostics in actor_diagnostics.values():
+            result_tensors.update(diagnostics)
+        metric_names = list(result_tensors)
+        metric_values = torch.stack([
+            result_tensors[name].reshape(()) for name in metric_names
+        ]).detach().cpu().tolist()
+        return {name: float(value) for name, value in zip(metric_names, metric_values)}
+
+    @staticmethod
+    def _gradient_l2_norm(parameters):
+        squared_norms = [
+            parameter.grad.detach().pow(2).sum()
+            for parameter in parameters if parameter.grad is not None
+        ]
+        if not squared_norms:
+            if parameters:
+                return parameters[0].new_zeros(())
+            return torch.zeros(())
+        return torch.sqrt(torch.stack(squared_norms).sum())
 
     def _soft_update(self, source, target):
         with torch.no_grad():
@@ -346,6 +475,8 @@ class HASAC:
             "observation_schema": {
                 "driving_dim": self.driving_state_dim,
                 "energy_dim": self.energy_state_dim,
+                "driving_features": self.driving_state_features,
+                "energy_features": self.energy_state_features,
             },
             "driving_actor": self.driving_actor.state_dict(),
             "energy_actor": self.energy_actor.state_dict(),

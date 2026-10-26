@@ -7,11 +7,12 @@ from torch import nn
 from torch.distributions import Normal
 
 
-def mlp(input_dim: int, output_dim: int, hidden_layers=(256, 128, 64)):
+def mlp(input_dim: int, output_dim: int, hidden_layers=(256, 128, 64),
+        activation_factory=nn.ReLU):
     layers = []
     last = input_dim
     for width in hidden_layers:
-        layers.extend((nn.Linear(last, int(width)), nn.ReLU()))
+        layers.extend((nn.Linear(last, int(width)), activation_factory()))
         last = int(width)
     layers.append(nn.Linear(last, output_dim))
     return nn.Sequential(*layers)
@@ -23,7 +24,10 @@ class GaussianActor(nn.Module):
 
     def __init__(self, state_dim, action_dim, hidden_layers=(256, 128, 64)):
         super().__init__()
-        self.backbone = mlp(state_dim, 2 * action_dim, hidden_layers)
+        self.backbone = mlp(
+            state_dim, 2 * action_dim, hidden_layers,
+            activation_factory=lambda: nn.LeakyReLU(negative_slope=0.01),
+        )
         self.action_dim = int(action_dim)
 
     def forward(self, state):
@@ -62,7 +66,10 @@ class GaussianActor(nn.Module):
 class DeterministicActor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_layers=(256, 128, 64)):
         super().__init__()
-        self.net = mlp(state_dim, action_dim, hidden_layers)
+        self.net = mlp(
+            state_dim, action_dim, hidden_layers,
+            activation_factory=lambda: nn.LeakyReLU(negative_slope=0.01),
+        )
 
     def forward(self, state):
         return torch.tanh(self.net(state))
