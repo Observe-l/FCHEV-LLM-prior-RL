@@ -1,1 +1,1 @@
-"""Continuous-control HASAC, SAC and TD3 implementations."""
+"""Continuous-control MAPPO, HASAC, SAC and TD3 implementations."""

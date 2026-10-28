@@ -1,5 +1,8 @@
 {
   "seed": 7,
+  "observation": {
+    "normalization_enabled": true
+  },
   "sumo": {
     "binary": "sumo",
     "gui_binary": "sumo-gui",
@@ -130,14 +133,14 @@
     "speeding_termination_fraction": 0.2
   },
   "training": {
-    "algorithm": "hasac",
+    "algorithm": "mappo",
     "episodes": 1000,
     "hidden_layers": [
       256,
       128,
       64
     ],
-    "gamma": 0.9999,
+    "gamma": 0.99,
     "tau": 0.005,
     "replay_capacity": 100000,
     "batch_size": 64,
@@ -149,6 +152,20 @@
     "plot_interval_episodes": 10,
     "actor_learning_rate": 0.0003,
     "critic_learning_rate": 0.0003,
+    "mappo_gae_lambda": 0.999,
+    "mappo_clip_param": 0.2,
+    "mappo_ppo_epochs": 10,
+    "mappo_num_minibatches": 8,
+    "mappo_value_loss_coef": 1.0,
+    "mappo_entropy_coef": 0.01,
+    "mappo_max_grad_norm": 10.0,
+    "mappo_value_clip": 0.2,
+    "mappo_huber_delta": 10.0,
+    "mappo_min_policy_std": 0.000001,
+    "mappo_action_transform": "gaussian_clip",
+    "mappo_action_clip_low": -1.0,
+    "mappo_action_clip_high": 1.0,
+    "mappo_normalize_advantage": true,
     "temperature_learning_rate": 0.0003,
     "hasac_alpha": 1.0,
     "td3_policy_noise": 0.2,
