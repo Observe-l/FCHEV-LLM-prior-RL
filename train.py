@@ -18,6 +18,7 @@ import torch
 from algorithm.sac import SAC
 from algorithm.td3 import TD3
 from algorithm.hasac import HASAC
+from algorithm.maddpg import MADDPG
 from algorithm.mappo import MAPPO
 from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
@@ -229,7 +230,7 @@ def split_agent_rewards(info):
 
 
 def is_dual_policy_agent(agent):
-    return isinstance(agent, (TwoAgentSAC, HASAC, MAPPO))
+    return isinstance(agent, (TwoAgentSAC, HASAC, MAPPO, MADDPG))
 
 
 def _apply_prior_lambda_schedule(agent, schedule, episode):
@@ -271,9 +272,11 @@ def make_agent(name, obs_dim, action_dim, config, seed):
         return HASAC(config, seed)
     if name.lower() == "mappo":
         return MAPPO(config, seed)
+    if name.lower() == "maddpg":
+        return MADDPG(config, seed)
     if name.lower() == "td3":
         return TD3(obs_dim, action_dim, config, seed)
-    raise ValueError(f"Unknown algorithm {name!r}; choose mappo, hasac, sac or td3")
+    raise ValueError(f"Unknown algorithm {name!r}; choose maddpg, mappo, hasac, sac, td3")
 
 
 def _write_csv(path: Path, rows, fields=None):
@@ -551,6 +554,16 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
                 physical_action = map_split_actions(
                     driving_action, energy_action, env.action_space
                 )
+            elif isinstance(agent, MADDPG):
+                driving_state, energy_state = split_agent_observations(
+                    obs, vehicle_cfg, normalization_enabled
+                )
+                driving_action, energy_action = agent.select_actions(
+                    driving_state, energy_state, deterministic=True
+                )
+                physical_action = map_split_actions(
+                    driving_action, energy_action, env.action_space
+                )
             elif isinstance(agent, HASAC):
                 driving_state, energy_state = split_agent_observations(
                     obs, vehicle_cfg, normalization_enabled
@@ -623,7 +636,7 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Train multi-agent policies on the SUMO FCHEV environment")
     parser.add_argument("--config", default="config/default.json")
-    parser.add_argument("--algorithm", choices=["mappo", "sac", "hasac", "td3"], default=None)
+    parser.add_argument("--algorithm", choices=["maddpg", "mappo", "sac", "hasac", "td3"], default=None)
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--gamma", type=float, default=None,
                         help="Override the selected algorithm's discount factor")
@@ -671,8 +684,8 @@ def main(argv=None):
         resume_checkpoint = resume_checkpoint.resolve()
         if not resume_checkpoint.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint}")
-        if algorithm_name not in ("hasac", "mappo"):
-            raise ValueError("--resume-checkpoint currently supports HASAC and MAPPO")
+        if algorithm_name not in ("hasac", "mappo", "maddpg"):
+            raise ValueError("--resume-checkpoint currently supports HASAC, MAPPO, and MADDPG")
         cfg["training"]["resume_checkpoint"] = str(resume_checkpoint)
         cfg["training"]["resume_replay_buffer"] = False
     resumed_from_checkpoint = resume_checkpoint is not None
@@ -729,6 +742,8 @@ def main(argv=None):
         if algorithm_name == "hasac" else
         "mappo_shared_reward_centralized_value_decentralized_actors"
         if algorithm_name == "mappo" else
+        "maddpg_separate_rewards_centralized_critics_decentralized_actors"
+        if algorithm_name == "maddpg" else
         "independent_driving_and_energy_sac" if algorithm_name == "sac" else
         "single_agent"
     )
@@ -743,7 +758,7 @@ def main(argv=None):
             "checkpoint_contents": "full agent and optimizer state",
             "agents": (
                 ["driving", "energy_management"]
-                if algorithm_name in ("sac", "hasac", "mappo") else ["joint"]
+                if algorithm_name in ("sac", "hasac", "mappo", "maddpg") else ["joint"]
             ),
             "hasac_critic": "centralized twin soft Q over joint state and actions"
             if algorithm_name == "hasac" else None,
@@ -753,6 +768,10 @@ def main(argv=None):
             if algorithm_name == "mappo" else None,
             "mappo_reward": "same shared team reward for both decentralized actors"
             if algorithm_name == "mappo" else None,
+            "maddpg_critics": "two centralized critics over the full 15-dimensional state and joint action"
+            if algorithm_name == "maddpg" else None,
+            "maddpg_reward": "driving critic uses driving reward; energy critic uses energy reward"
+            if algorithm_name == "maddpg" else None,
         }, f, indent=2)
     top_reward_checkpoints = []
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
@@ -765,8 +784,8 @@ def main(argv=None):
         env.action_space.shape[0], agent_config, seed,
     )
     if resumed_from_checkpoint:
-        if not isinstance(agent, (HASAC, MAPPO)):
-            raise TypeError("Checkpoint loading requires a HASAC or MAPPO agent")
+        if not isinstance(agent, (HASAC, MAPPO, MADDPG)):
+            raise TypeError("Checkpoint loading requires a HASAC, MAPPO, or MADDPG agent")
         requested_prior_cfg = dict(cfg.get("llm_prior", {}))
         agent.load(resume_checkpoint, load_optimizers=True)
         # The source checkpoint may have been trained without a prior. Restore
@@ -776,14 +795,15 @@ def main(argv=None):
         agent.lambda_std = float(requested_prior_cfg.get("lambda_1", 0.5))
         if isinstance(agent, MAPPO):
             agent._validate_prior_lambdas()
-        else:
+        elif isinstance(agent, HASAC):
             if not 0.0 <= agent.lambda_mean <= 1.0:
                 raise ValueError("llm_prior.lambda_0 must be in [0, 1]")
             if not 0.0 <= agent.lambda_std <= 1.0:
                 raise ValueError("llm_prior.lambda_1 must be in [0, 1]")
-        agent.prior_provider = agent._build_prior_provider()
-        if requested_prior_cfg.get("enabled", False) and agent.prior_provider is None:
-            raise ValueError("Resume config enables prior but did not load its program")
+        if isinstance(agent, (HASAC, MAPPO)):
+            agent.prior_provider = agent._build_prior_provider()
+            if requested_prior_cfg.get("enabled", False) and agent.prior_provider is None:
+                raise ValueError("Resume config enables prior but did not load its program")
         # Preserve the new run's configured discount factor; on-policy data is
         # always recollected after resume.
         agent.gamma = float(tr["gamma"])
@@ -899,6 +919,29 @@ def main(argv=None):
                     physical_action = map_split_actions(
                         driving_action_unit, energy_action_unit, env.action_space
                     )
+                elif isinstance(agent, MADDPG):
+                    if global_step < learning_starts and not resumed_from_checkpoint:
+                        driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                        energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                    else:
+                        driving_action_unit, energy_action_unit = agent.select_actions(
+                            driving_state, energy_state, deterministic=True
+                        )
+                        exploration_noise = float(tr.get("exploration_noise", 0.1))
+                        driving_action_unit = np.clip(
+                            driving_action_unit + np.random.normal(0.0, exploration_noise, size=1),
+                            -1.0, 1.0,
+                        ).astype(np.float32)
+                        energy_action_unit = np.clip(
+                            energy_action_unit + np.random.normal(0.0, exploration_noise, size=1),
+                            -1.0, 1.0,
+                        ).astype(np.float32)
+                    action_unit = np.asarray(
+                        [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
+                    )
+                    physical_action = map_split_actions(
+                        driving_action_unit, energy_action_unit, env.action_space
+                    )
                 elif isinstance(agent, HASAC):
                     if global_step < learning_starts and not resumed_from_checkpoint:
                         driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
@@ -983,6 +1026,11 @@ def main(argv=None):
                             policy_record, reward, next_state,
                             terminated=terminated,
                             truncated=bool(truncated or artificial_truncation),
+                        )
+                    elif isinstance(agent, MADDPG):
+                        agent.store_transition(
+                            state, action_unit, driving_reward, energy_reward,
+                            next_state, bool(terminated),
                         )
                     else:
                         agent.driving.replay.add(
@@ -1320,6 +1368,14 @@ def main(argv=None):
                                     losses[f"{name}_prior_lambda_0"] = lambda_0
                                     losses[f"{name}_prior_lambda_1"] = lambda_1
                             updates.append(losses)
+                if isinstance(agent, MADDPG) and len(agent.replay) >= batch_size and (
+                    global_step >= learning_starts or resumed_from_checkpoint
+                ):
+                    for _ in range(int(tr.get("updates_per_step", 1))):
+                        losses = agent.update(batch_size)
+                        losses["agent"] = "maddpg"
+                        losses["global_step"] = global_step
+                        updates.append(losses)
                 if terminated or truncated or (args.max_steps is not None and local_step >= args.max_steps):
                     break
             if isinstance(agent, MAPPO):
@@ -1383,6 +1439,8 @@ def main(argv=None):
                 "driving_prior_lambda_0", "driving_prior_lambda_1",
                 "energy_prior_lambda_0", "energy_prior_lambda_1",
                 "driving_actor_loss", "energy_actor_loss", "alpha_loss", "alpha",
+                "driving_critic_loss", "energy_critic_loss",
+                "driving_q_mean", "energy_q_mean",
                 "critic_q1_replay_mean", "critic_q2_replay_mean",
                 "critic_target_mean", "critic_target_state_std",
                 "driving_q_policy", "driving_q1_policy", "driving_q2_policy",
@@ -1513,12 +1571,14 @@ def main(argv=None):
             if isinstance(agent, HASAC) else
             "mappo_shared_reward_centralized_value_decentralized_actors"
             if isinstance(agent, MAPPO) else
+            "maddpg_separate_rewards_centralized_critics_decentralized_actors"
+            if isinstance(agent, MADDPG) else
             "independent_driving_and_energy_sac"
             if isinstance(agent, TwoAgentSAC) else "single_agent"
         ),
         "agent_observation_dimensions": (
             {"driving": agent.driving_state_dim, "energy": agent.energy_state_dim}
-            if isinstance(agent, (HASAC, MAPPO)) else
+            if isinstance(agent, (HASAC, MAPPO, MADDPG)) else
             {"driving": 11, "energy": 5}
             if isinstance(agent, TwoAgentSAC) else
             {"joint": env.observation_space.shape[0]}
@@ -1526,7 +1586,8 @@ def main(argv=None):
         "centralized_critic_state_dimension": (
             agent.global_state_dim if isinstance(agent, MAPPO) else
             agent.driving_state_dim + agent.energy_state_dim
-            if isinstance(agent, HASAC) else None
+            if isinstance(agent, HASAC) else
+            agent.global_state_dim if isinstance(agent, MADDPG) else None
         ),
         "hasac_entropy_temperature": agent.alpha if isinstance(agent, HASAC) else None,
         "hasac_shared_reward_definition": (
@@ -1538,6 +1599,11 @@ def main(argv=None):
         "mappo_shared_reward_definition": (
             "driving_reward + energy_reward; identical team reward for both actors"
             if isinstance(agent, MAPPO) else None
+        ),
+        "maddpg_gamma": agent.gamma if isinstance(agent, MADDPG) else None,
+        "maddpg_reward_definition": (
+            "driving actor/critic optimize driving_reward; energy actor/critic optimize energy_reward"
+            if isinstance(agent, MADDPG) else None
         ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)
