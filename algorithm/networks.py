@@ -71,8 +71,12 @@ class DeterministicActor(nn.Module):
             activation_factory=lambda: nn.LeakyReLU(negative_slope=0.01),
         )
 
+    def pre_tanh(self, state):
+        """Return the deterministic policy's latent action before tanh."""
+        return self.net(state)
+
     def forward(self, state):
-        return torch.tanh(self.net(state))
+        return torch.tanh(self.pre_tanh(state))
 
 
 class Critic(nn.Module):

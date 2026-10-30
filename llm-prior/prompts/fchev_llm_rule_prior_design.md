@@ -11,6 +11,8 @@
 - 减少氢耗、FCS 退化、电池 SOH 损失和 EDU 损耗；
 - 维持电池 SOC 接近目标值 0.5。
 
+控制周期为每步 1 s。每个 step 中，两个 actor 都根据该时刻的 observation 各自重新决策；rule program 也使用同一时刻的 observation 评估一次并生成相应 prior。该步的 action 和 prior 只用于当前 step，并在下一个 step 根据新 observation 重新计算。
+
 SOC 偏差是能量管理目标，不是电池退化量。现有观测没有直接包含电机转矩、即时 EDU 损耗、FCS 功率请求、电池功率或氢耗；规则不得假设这些量能从 observation 直接读取。如果需要根据它们决策，只能使用明确标注的近似估计，并说明该估计的限制。
 
 ### 2. 当前仿真环境与精确数值

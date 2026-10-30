@@ -254,6 +254,18 @@ class SumoInterface:
         ahead = self.traffic_lights_ahead(vehicle_id)
         return ahead[0] if ahead else None
 
+    def traffic_light_link_state(self, tls_id: str, link_index: int):
+        """Read the current SUMO state for one signal link by its TLS index."""
+        self.traci.switch(self.label)
+        tls_id = str(tls_id)
+        if tls_id not in self.traci.trafficlight.getIDList():
+            return None
+        state = str(self.traci.trafficlight.getRedYellowGreenState(tls_id))
+        index = int(link_index)
+        if index < 0 or index >= len(state):
+            return None
+        return state[index]
+
     def _update_lead_intersection_speed_limit(self):
         """Apply the optional 30 km/h limit before the lead reaches a signal."""
         if "lead" not in self.traci.vehicle.getIDList():

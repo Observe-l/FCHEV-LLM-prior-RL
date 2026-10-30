@@ -1,10 +1,66 @@
-# LLM/rule Gaussian policy prior
+# LLM/rule policy priors
 
-This folder defines the boundary between a Python rule/LLM-generated program
-and HASAC. A selected program receives the complete **raw 15-element
-environment observation** and returns Gaussian prior parameters for both
-agents in the same pre-`tanh` latent space as their actors. It does not return
-a physical acceleration or power command.
+This folder documents both HASAC Gaussian priors and deterministic MADDPG
+rule actions. The interfaces are different: HASAC rules return mean/std;
+MADDPG rules return one deterministic value per actor and do not use a std.
+
+## MADDPG rule modes
+
+MADDPG rules receive the full raw 15-value environment observation and return
+both `driving` and `energy` entries. Each may include `active` (default
+`True`). The output mode determines the field and units:
+
+| CLI mode | Rule field | Units | Fusion |
+|---|---|---|---|
+| `physical_action` | `action` | Driving: m/s²; energy: kW | Convert actor to physical units, blend, convert back |
+| `normalized_action` | `action` | Each scalar in `[-1,1]` | Blend normalized actions, then map to physical units |
+| `pre_tanh` | `prior` (legacy `mean` accepted; `std` ignored) | Deterministic latent value | Blend actor/rule latent values, apply tanh, then map |
+
+Fusion uses one lambda in `[0,1]` for both channels. The blend happens in the
+selected mode's space: physical units for `physical_action`, normalized units
+for `normalized_action`, and pre-tanh latent values for `pre_tanh`.
+
+```text
+physical_action:  a_fused = (1 - λ) * a_actor_physical + λ * a_rule_physical
+normalized_action: u_fused = (1 - λ) * u_actor + λ * u_rule
+pre_tanh:          z_fused = (1 - λ) * z_actor + λ * z_rule
+                   u_fused = tanh(z_fused)
+```
+
+`active=False` bypasses fusion for that actor. Training adds the configured
+Gaussian exploration noise to the actor's normalized action before fusion. In
+`pre_tanh` mode, the behavior action is numerically mapped back with `atanh`;
+actor-gradient and target updates use the network latent directly.
+Fresh runs have 1,000 random warm-up steps without the prior; resumed runs
+skip that warm-up.
+
+Example:
+
+```bash
+python train.py \
+  --config config/experiments/maddpg_individual_reward_g099_500ep.json \
+  --algorithm maddpg \
+  --prior-program-name fchev_rule_prior \
+  --maddpg-rule-output-mode pre_tanh \
+  --maddpg-rule-lambda 0.2
+```
+
+Three standalone English prompts for generating MADDPG rules are:
+
+- `prompts/fchev_maddpg_rule_prior_physical_action_en.md`
+- `prompts/fchev_maddpg_rule_prior_normalized_action_en.md`
+- `prompts/fchev_maddpg_rule_prior_pre_tanh_en.md`
+
+The environment's driving action is acceleration, not target speed. The
+reward and observation facts checked against the implementation are recorded
+in `prompts/MADDPG_RULE_PROMPTS_AUDIT.md`.
+
+## HASAC Gaussian policy prior
+
+The existing HASAC interface remains separate. A selected HASAC program
+receives the complete raw 15-element environment observation and returns
+Gaussian prior parameters for both agents in their pre-`tanh` latent space.
+It does not return a physical acceleration or power command.
 
 ## Selectable Python program interface
 
@@ -47,10 +103,10 @@ modules can just expose `predict(observation)`.
 
 The currently selected smoke-test program is
 `llm-prior/programs/speed_limit_rule.py`. That is the program to replace with
-an LLM-generated Python module, or select another module by changing
-`program_name`. `bridge.py` is a separate adapter for calling a hosted/runtime
-LLM that returns JSON; it is not required when the LLM has already generated a
-Python program.
+an LLM-generated Python module for **HASAC**, or select another module by
+changing `program_name`. It is not a MADDPG rule module. `bridge.py` is a
+separate adapter for calling a hosted/runtime LLM that returns JSON; it is not
+required when the LLM has already generated a Python program.
 
 ## Contract
 
@@ -96,5 +152,5 @@ off-policy update does not repeatedly query an LLM. The prompt is in
 `prompts/gaussian_rule_prior.md`. No LLM service or credentials are required by
 the included deterministic rule.
 
-The runnable example configuration is
+The runnable HASAC example configuration is
 `config/experiments/hasac_zone_enabled_road60_max70_tlgreen5_pass50_speedbeta100_gamma0p99_llm_rule_prior.json`.

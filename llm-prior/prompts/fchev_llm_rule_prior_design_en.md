@@ -11,6 +11,8 @@ The objectives are to complete the driving task while:
 - Reducing hydrogen consumption, FCS degradation, battery SOH loss, and EDU losses;
 - Keeping battery SOC close to its target of 0.5.
 
+The control loop runs at 1 s per step. At every step, each actor makes a new decision using that step's current observation, and the rule program is evaluated once on the same observation to produce its prior(s). Each decision applies to the current step and is recomputed from the newly observed state at the next step.
+
 SOC deviation is an energy-management objective, not a battery degradation metric. The current observation does not directly include motor torque, instantaneous EDU loss, requested FCS power, battery power, or hydrogen consumption. Do not assume these quantities are directly available to the rule. If a rule needs to estimate them, clearly label the estimate as an approximation and explain its limitations.
 
 ### 2. Current Simulation Environment and Exact Values

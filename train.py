@@ -4,6 +4,7 @@ import argparse
 import csv
 from collections import Counter
 from datetime import datetime
+from importlib import import_module
 import os
 import json
 from pathlib import Path
@@ -23,6 +24,12 @@ from algorithm.mappo import MAPPO
 from algorithm.two_agent_sac import TwoAgentSAC
 from environment.fchev_env import FCHEVEnv, load_config
 from util.observation import normalize_observation
+
+
+MADDPGRuleAdapter = import_module(
+    "llm-prior.maddpg_contract"
+).MADDPGRuleAdapter
+MADDPG_RULE_MODES = ("none", "physical_action", "normalized_action", "pre_tanh")
 
 
 TRACE_FIELDS = [
@@ -49,6 +56,11 @@ TRACE_FIELDS = [
     "policy_driving_prior_lambda_0", "policy_driving_prior_lambda_1",
     "policy_energy_prior_mean", "policy_energy_prior_std", "policy_energy_prior_active",
     "policy_energy_prior_lambda_0", "policy_energy_prior_lambda_1",
+    "policy_maddpg_rule_mode", "policy_maddpg_rule_lambda",
+    "policy_maddpg_driving_actor_unit", "policy_maddpg_energy_actor_unit",
+    "policy_maddpg_driving_rule_value", "policy_maddpg_energy_rule_value",
+    "policy_maddpg_driving_rule_active", "policy_maddpg_energy_rule_active",
+    "policy_maddpg_driving_fused_unit", "policy_maddpg_energy_fused_unit",
     "energy_agent_observation_ego_acceleration_div1p5",
     "energy_agent_observation_ego_speed_div20",
     "energy_agent_observation_soc",
@@ -88,6 +100,9 @@ TRACE_FIELDS = [
     "lead_traffic_light_crossing", "lead_traffic_light_crossed_id",
     "lead_traffic_lights_passed", "traffic_light_state", "traffic_light_distance_m",
     "traffic_light_remaining_s", "time_to_traffic_light_s",
+    "traffic_light_state_before_crossing_step",
+    "traffic_light_state_after_crossing_step",
+    "traffic_light_state_at_crossing", "traffic_light_crossing_elapsed_s",
     "traffic_light_reward_active", "traffic_light_reward",
     "traffic_light_reward_contribution",
     "speed_limit_entry_active", "speed_limit_entry_error_before",
@@ -561,8 +576,20 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
                 driving_action, energy_action = agent.select_actions(
                     driving_state, energy_state, deterministic=True
                 )
+                actor_action_unit = np.asarray(
+                    [driving_action[0], energy_action[0]], dtype=np.float32
+                )
+                rule = (
+                    agent.rule_adapter.predict(obs)
+                    if getattr(agent, "rule_adapter", None) is not None else None
+                )
+                action_unit = agent.fuse_numpy_actions(
+                    actor_action_unit,
+                    rule["values"][0] if rule is not None else None,
+                    rule["active"][0] if rule is not None else None,
+                )
                 physical_action = map_split_actions(
-                    driving_action, energy_action, env.action_space
+                    action_unit[:1], action_unit[1:], env.action_space
                 )
             elif isinstance(agent, HASAC):
                 driving_state, energy_state = split_agent_observations(
@@ -655,7 +682,17 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--prior-program-name", default=None,
-        help="Override llm_prior.program_name (the prior must also be enabled in config)",
+        help="Override llm_prior.program_name for HASAC priors or MADDPG rule programs",
+    )
+    parser.add_argument(
+        "--maddpg-rule-output-mode",
+        choices=MADDPG_RULE_MODES,
+        default=None,
+        help="MADDPG rule output adapter: none, physical_action, normalized_action, or pre_tanh",
+    )
+    parser.add_argument(
+        "--maddpg-rule-lambda", type=float, default=None,
+        help="MADDPG actor/rule action blend weight in [0, 1]",
     )
     parser.add_argument(
         "--resume-checkpoint", default=None,
@@ -690,6 +727,31 @@ def main(argv=None):
         cfg["training"]["resume_replay_buffer"] = False
     resumed_from_checkpoint = resume_checkpoint is not None
     tr = dict(cfg["training"])
+    maddpg_rule_mode = str(
+        args.maddpg_rule_output_mode
+        if args.maddpg_rule_output_mode is not None
+        else tr.get("maddpg_rule_output_mode", "none")
+    )
+    maddpg_rule_lambda = float(
+        args.maddpg_rule_lambda
+        if args.maddpg_rule_lambda is not None
+        else tr.get("maddpg_rule_lambda", cfg.get("llm_prior", {}).get("lambda_0", 0.2))
+    )
+    if maddpg_rule_mode not in MADDPG_RULE_MODES:
+        raise ValueError(f"Unsupported MADDPG rule mode {maddpg_rule_mode!r}")
+    if not 0.0 <= maddpg_rule_lambda <= 1.0:
+        raise ValueError("--maddpg-rule-lambda must be in [0, 1]")
+    if maddpg_rule_mode != "none" and algorithm_name != "maddpg":
+        raise ValueError("MADDPG rule output modes can only be used with --algorithm maddpg")
+    maddpg_rule_program = None
+    if maddpg_rule_mode != "none":
+        maddpg_rule_program = cfg.get("llm_prior", {}).get("program_name")
+        if not maddpg_rule_program:
+            raise ValueError(
+                "A MADDPG rule mode requires llm_prior.program_name or --prior-program-name"
+            )
+    tr["maddpg_rule_output_mode"] = maddpg_rule_mode
+    tr["maddpg_rule_lambda"] = maddpg_rule_lambda
     episodes = int(args.episodes if args.episodes is not None else tr["episodes"])
     seed = int(args.seed if args.seed is not None else cfg["seed"])
     learning_starts = int(args.learning_starts if args.learning_starts is not None else tr["learning_starts"])
@@ -772,6 +834,9 @@ def main(argv=None):
             if algorithm_name == "maddpg" else None,
             "maddpg_reward": "driving critic uses driving reward; energy critic uses energy reward"
             if algorithm_name == "maddpg" else None,
+            "maddpg_rule_output_mode": maddpg_rule_mode if algorithm_name == "maddpg" else None,
+            "maddpg_rule_program": maddpg_rule_program if algorithm_name == "maddpg" else None,
+            "maddpg_rule_lambda": maddpg_rule_lambda if algorithm_name == "maddpg" else None,
         }, f, indent=2)
     top_reward_checkpoints = []
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
@@ -779,10 +844,22 @@ def main(argv=None):
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
     agent_config = dict(tr)
     agent_config["llm_prior"] = dict(cfg.get("llm_prior", {}))
+    agent_config["action_low"] = env.action_space.low.tolist()
+    agent_config["action_high"] = env.action_space.high.tolist()
     agent = make_agent(
         algorithm_name, env.observation_space.shape[0],
         env.action_space.shape[0], agent_config, seed,
     )
+    if isinstance(agent, MADDPG) and maddpg_rule_mode != "none":
+        agent.rule_adapter = MADDPGRuleAdapter(
+            maddpg_rule_program,
+            maddpg_rule_mode,
+            env.action_space.low,
+            env.action_space.high,
+            config=cfg.get("llm_prior", {}),
+        )
+    elif isinstance(agent, MADDPG):
+        agent.rule_adapter = None
     if resumed_from_checkpoint:
         if not isinstance(agent, (HASAC, MAPPO, MADDPG)):
             raise TypeError("Checkpoint loading requires a HASAC, MAPPO, or MADDPG agent")
@@ -899,6 +976,9 @@ def main(argv=None):
                 policy_input_observation = np.asarray(state, dtype=np.float32).copy()
                 prior_output = None
                 policy_record = None
+                maddpg_rule_output = None
+                maddpg_actor_action_unit = None
+                maddpg_rule_fused_action_unit = None
                 energy_observed_acceleration_normalized = (
                     float(energy_state[0]) if is_dual_policy_agent(agent) else None
                 )
@@ -920,27 +1000,48 @@ def main(argv=None):
                         driving_action_unit, energy_action_unit, env.action_space
                     )
                 elif isinstance(agent, MADDPG):
+                    maddpg_rule_output = (
+                        agent.rule_adapter.predict(obs)
+                        if getattr(agent, "rule_adapter", None) is not None else None
+                    )
+                    rule_values_now = (
+                        maddpg_rule_output["values"][0]
+                        if maddpg_rule_output is not None
+                        else np.zeros(2, dtype=np.float32)
+                    )
+                    rule_active_now = (
+                        maddpg_rule_output["active"][0]
+                        if maddpg_rule_output is not None
+                        else np.zeros(2, dtype=bool)
+                    )
                     if global_step < learning_starts and not resumed_from_checkpoint:
-                        driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
-                        energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
+                        actor_behavior_action_unit = np.random.uniform(
+                            -1.0, 1.0, size=2
+                        ).astype(np.float32)
+                        # Keep the initial replay warm-up random and prior-free.
+                        action_unit = actor_behavior_action_unit.copy()
                     else:
                         driving_action_unit, energy_action_unit = agent.select_actions(
                             driving_state, energy_state, deterministic=True
                         )
+                        maddpg_actor_action_unit = np.asarray(
+                            [driving_action_unit[0], energy_action_unit[0]],
+                            dtype=np.float32,
+                        )
                         exploration_noise = float(tr.get("exploration_noise", 0.1))
-                        driving_action_unit = np.clip(
-                            driving_action_unit + np.random.normal(0.0, exploration_noise, size=1),
+                        actor_behavior_action_unit = np.clip(
+                            maddpg_actor_action_unit
+                            + np.random.normal(0.0, exploration_noise, size=2),
                             -1.0, 1.0,
                         ).astype(np.float32)
-                        energy_action_unit = np.clip(
-                            energy_action_unit + np.random.normal(0.0, exploration_noise, size=1),
-                            -1.0, 1.0,
-                        ).astype(np.float32)
-                    action_unit = np.asarray(
-                        [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
-                    )
+                        action_unit = agent.fuse_numpy_actions(
+                            actor_behavior_action_unit,
+                            rule_values_now,
+                            rule_active_now,
+                        )
+                    maddpg_rule_fused_action_unit = action_unit.copy()
                     physical_action = map_split_actions(
-                        driving_action_unit, energy_action_unit, env.action_space
+                        action_unit[:1], action_unit[1:], env.action_space
                     )
                 elif isinstance(agent, HASAC):
                     if global_step < learning_starts and not resumed_from_checkpoint:
@@ -1028,9 +1129,25 @@ def main(argv=None):
                             truncated=bool(truncated or artificial_truncation),
                         )
                     elif isinstance(agent, MADDPG):
+                        next_maddpg_rule_output = (
+                            agent.rule_adapter.predict(next_obs)
+                            if getattr(agent, "rule_adapter", None) is not None else None
+                        )
+                        next_rule_values = (
+                            next_maddpg_rule_output["values"][0]
+                            if next_maddpg_rule_output is not None
+                            else np.zeros(2, dtype=np.float32)
+                        )
+                        next_rule_active = (
+                            next_maddpg_rule_output["active"][0]
+                            if next_maddpg_rule_output is not None
+                            else np.zeros(2, dtype=bool)
+                        )
                         agent.store_transition(
                             state, action_unit, driving_reward, energy_reward,
                             next_state, bool(terminated),
+                            rule_values_now, rule_active_now,
+                            next_rule_values, next_rule_active,
                         )
                     else:
                         agent.driving.replay.add(
@@ -1153,6 +1270,44 @@ def main(argv=None):
                         agent._agent_lambda_weights("energy")[1]
                         if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
                     ),
+                    "policy_maddpg_rule_mode": (
+                        agent.rule_output_mode if isinstance(agent, MADDPG) else None
+                    ),
+                    "policy_maddpg_rule_lambda": (
+                        agent.rule_lambda if isinstance(agent, MADDPG) else None
+                    ),
+                    "policy_maddpg_driving_actor_unit": (
+                        float(maddpg_actor_action_unit[0])
+                        if maddpg_actor_action_unit is not None else None
+                    ),
+                    "policy_maddpg_energy_actor_unit": (
+                        float(maddpg_actor_action_unit[1])
+                        if maddpg_actor_action_unit is not None else None
+                    ),
+                    "policy_maddpg_driving_rule_value": (
+                        float(maddpg_rule_output["values"][0, 0])
+                        if maddpg_rule_output is not None else None
+                    ),
+                    "policy_maddpg_energy_rule_value": (
+                        float(maddpg_rule_output["values"][0, 1])
+                        if maddpg_rule_output is not None else None
+                    ),
+                    "policy_maddpg_driving_rule_active": (
+                        int(maddpg_rule_output["active"][0, 0])
+                        if maddpg_rule_output is not None else None
+                    ),
+                    "policy_maddpg_energy_rule_active": (
+                        int(maddpg_rule_output["active"][0, 1])
+                        if maddpg_rule_output is not None else None
+                    ),
+                    "policy_maddpg_driving_fused_unit": (
+                        float(maddpg_rule_fused_action_unit[0])
+                        if maddpg_rule_fused_action_unit is not None else None
+                    ),
+                    "policy_maddpg_energy_fused_unit": (
+                        float(maddpg_rule_fused_action_unit[1])
+                        if maddpg_rule_fused_action_unit is not None else None
+                    ),
                     "energy_agent_observation_ego_acceleration_div1p5": energy_observed_acceleration_normalized,
                     "energy_agent_observation_ego_speed_div20": (
                         float(energy_state[1]) if is_dual_policy_agent(agent) else None
@@ -1255,6 +1410,18 @@ def main(argv=None):
                     "traffic_light_state": info.get("traffic_light_state_observation"),
                     "traffic_light_distance_m": info.get("traffic_light_distance_m"),
                     "traffic_light_remaining_s": info.get("traffic_light_remaining_s"),
+                    "traffic_light_state_before_crossing_step": info.get(
+                        "traffic_light_state_before_crossing_step"
+                    ),
+                    "traffic_light_state_after_crossing_step": info.get(
+                        "traffic_light_state_after_crossing_step"
+                    ),
+                    "traffic_light_state_at_crossing": info.get(
+                        "traffic_light_state_at_crossing"
+                    ),
+                    "traffic_light_crossing_elapsed_s": info.get(
+                        "traffic_light_crossing_elapsed_s"
+                    ),
                     "time_to_traffic_light_s": info.get("time_to_traffic_light_s"),
                     "traffic_light_reward_active": info.get("traffic_light_reward_active"),
                     "traffic_light_reward": info.get("traffic_light_reward"),
@@ -1604,6 +1771,17 @@ def main(argv=None):
         "maddpg_reward_definition": (
             "driving actor/critic optimize driving_reward; energy actor/critic optimize energy_reward"
             if isinstance(agent, MADDPG) else None
+        ),
+        "maddpg_rule_output_mode": (
+            agent.rule_output_mode if isinstance(agent, MADDPG) else None
+        ),
+        "maddpg_rule_program": (
+            agent.rule_adapter.program_name
+            if isinstance(agent, MADDPG) and getattr(agent, "rule_adapter", None) is not None
+            else None
+        ),
+        "maddpg_rule_lambda": (
+            agent.rule_lambda if isinstance(agent, MADDPG) else None
         ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)

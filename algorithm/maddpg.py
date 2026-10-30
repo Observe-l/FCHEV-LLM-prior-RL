@@ -20,7 +20,10 @@ class MADDPGReplayBuffer:
         self.reward_dim = int(reward_dim)
         self.capacity = int(capacity)
         self.device = torch.device(device)
-        self.row_width = 2 * self.state_dim + self.action_dim + self.reward_dim + 1
+        self.row_width = (
+            2 * self.state_dim + self.action_dim + self.reward_dim + 1
+            + 4 * self.action_dim
+        )
         self.data = torch.empty(
             (self.capacity, self.row_width), dtype=torch.float32, device=self.device
         )
@@ -29,13 +32,20 @@ class MADDPGReplayBuffer:
         self.generator = torch.Generator(device=self.device)
         self.generator.manual_seed(int(seed))
 
-    def add(self, state, action, rewards, next_state, done):
+    def add(self, state, action, rewards, next_state, done,
+            rule_values=None, rule_active=None,
+            next_rule_values=None, next_rule_active=None):
         row = np.empty(self.row_width, dtype=np.float32)
+        zeros = np.zeros(self.action_dim, dtype=np.float32)
         offset = 0
         for value, width in (
             (state, self.state_dim), (action, self.action_dim),
             (rewards, self.reward_dim), (next_state, self.state_dim),
             ([float(done)], 1),
+            (zeros if rule_values is None else rule_values, self.action_dim),
+            (zeros if rule_active is None else rule_active, self.action_dim),
+            (zeros if next_rule_values is None else next_rule_values, self.action_dim),
+            (zeros if next_rule_active is None else next_rule_active, self.action_dim),
         ):
             row[offset:offset + width] = value
             offset += width
@@ -52,9 +62,19 @@ class MADDPGReplayBuffer:
         a0 = s0 + self.action_dim
         r0 = a0 + self.reward_dim
         ns0 = r0 + self.state_dim
+        # ns0 is already the end offset of next_state. The terminal flag is
+        # the next single column; adding state_dim here shifts every rule
+        # field beyond the replay row and returned incorrectly shaped slices.
+        done0 = ns0
+        rule0 = done0 + 1
+        active0 = rule0 + self.action_dim
+        next_rule0 = active0 + self.action_dim
+        next_active0 = next_rule0 + self.action_dim
         return (
             batch[:, :s0], batch[:, s0:a0], batch[:, a0:r0],
-            batch[:, r0:ns0], batch[:, ns0:],
+            batch[:, r0:ns0], batch[:, done0:rule0],
+            batch[:, rule0:active0], batch[:, active0:next_rule0],
+            batch[:, next_rule0:next_active0], batch[:, next_active0:],
         )
 
     def __len__(self):
@@ -108,12 +128,111 @@ class MADDPG:
         }
         self.gamma = float(config.get("gamma", 0.99))
         self.tau = float(config.get("tau", 0.005))
+        self.rule_output_mode = str(config.get("maddpg_rule_output_mode", "none"))
+        self.rule_lambda = float(config.get("maddpg_rule_lambda", 0.2))
+        if self.rule_output_mode not in (
+            "none", "physical_action", "normalized_action", "pre_tanh"
+        ):
+            raise ValueError(f"Unsupported MADDPG rule mode: {self.rule_output_mode!r}")
+        if not 0.0 <= self.rule_lambda <= 1.0:
+            raise ValueError("maddpg_rule_lambda must be in [0, 1]")
+        self.action_low = np.asarray(
+            config.get("action_low", [-1.5, 0.0]), dtype=np.float32
+        ).reshape(2)
+        self.action_high = np.asarray(
+            config.get("action_high", [0.7, 50.0]), dtype=np.float32
+        ).reshape(2)
+        if np.any(self.action_high <= self.action_low):
+            raise ValueError("MADDPG action_high must be greater than action_low")
         self.replay = MADDPGReplayBuffer(
             self.global_state_dim, self.joint_action_dim, reward_dim=2,
             capacity=config.get("replay_capacity", 100000), seed=seed,
             device=self.device,
         )
         self.update_count = 0
+
+    def fuse_numpy_actions(self, actor_actions, rule_values=None, rule_active=None):
+        """Return the normalized joint action after optional rule fusion."""
+        actor = np.asarray(actor_actions, dtype=np.float32).reshape(2)
+        if self.rule_output_mode == "none" or rule_values is None:
+            return actor.copy()
+        rule = np.asarray(rule_values, dtype=np.float32).reshape(2)
+        active = np.ones(2, dtype=np.float32) if rule_active is None else np.asarray(
+            rule_active, dtype=np.float32
+        ).reshape(2)
+        weight = self.rule_lambda * active
+        if self.rule_output_mode == "physical_action":
+            actor_physical = self._unit_to_physical_numpy(actor)
+            mixed_physical = (1.0 - weight) * actor_physical + weight * rule
+            return np.clip(self._physical_to_unit_numpy(mixed_physical), -1.0, 1.0)
+        if self.rule_output_mode == "pre_tanh":
+            # The actor API exposes normalized tanh actions. Invert that map
+            # before blending so this mode truly mixes pre-tanh latents.
+            actor_latent = np.arctanh(np.clip(actor, -0.999999, 0.999999))
+            return np.tanh((1.0 - weight) * actor_latent + weight * rule)
+        rule_unit = rule
+        return np.clip((1.0 - weight) * actor + weight * rule_unit, -1.0, 1.0)
+
+    def _unit_to_physical_numpy(self, unit):
+        unit = np.asarray(unit, dtype=np.float32).reshape(2)
+        acceleration = (
+            unit[0] * abs(float(self.action_low[0]))
+            if unit[0] < 0.0 else unit[0] * float(self.action_high[0])
+        )
+        power = self.action_low[1] + (unit[1] + 1.0) * 0.5 * (
+            self.action_high[1] - self.action_low[1]
+        )
+        return np.asarray([acceleration, power], dtype=np.float32)
+
+    def _physical_to_unit_numpy(self, physical):
+        physical = np.asarray(physical, dtype=np.float32).reshape(2)
+        acceleration = (
+            physical[0] / abs(float(self.action_low[0]))
+            if physical[0] < 0.0 else physical[0] / float(self.action_high[0])
+        )
+        power = 2.0 * (physical[1] - self.action_low[1]) / (
+            self.action_high[1] - self.action_low[1]
+        ) - 1.0
+        return np.asarray([acceleration, power], dtype=np.float32)
+
+    def _fuse_torch_actions(self, actor_actions, rule_values, rule_active,
+                            actor_pre_tanh=False):
+        if self.rule_output_mode == "none":
+            return actor_actions
+        active = rule_active.to(dtype=actor_actions.dtype)
+        weight = self.rule_lambda * active
+        if self.rule_output_mode == "physical_action":
+            low = torch.as_tensor(self.action_low, dtype=actor_actions.dtype, device=self.device)
+            high = torch.as_tensor(self.action_high, dtype=actor_actions.dtype, device=self.device)
+            actor_acceleration = torch.where(
+                actor_actions[:, :1] < 0.0,
+                actor_actions[:, :1] * torch.abs(low[0]),
+                actor_actions[:, :1] * high[0],
+            )
+            actor_power = low[1] + (actor_actions[:, 1:2] + 1.0) * 0.5 * (
+                high[1] - low[1]
+            )
+            actor_physical = torch.cat((actor_acceleration, actor_power), dim=-1)
+            mixed_physical = (1.0 - weight) * actor_physical + weight * rule_values
+            normalized_acceleration = torch.where(
+                mixed_physical[:, :1] < 0.0,
+                mixed_physical[:, :1] / torch.abs(low[0]),
+                mixed_physical[:, :1] / high[0],
+            )
+            normalized_power = 2.0 * (mixed_physical[:, 1:2] - low[1]) / (
+                high[1] - low[1]
+            ) - 1.0
+            return torch.cat(
+                (normalized_acceleration, normalized_power), dim=-1
+            ).clamp(-1.0, 1.0)
+        if self.rule_output_mode == "pre_tanh":
+            actor_latent = (
+                actor_actions if actor_pre_tanh
+                else torch.atanh(actor_actions.clamp(-0.999999, 0.999999))
+            )
+            return torch.tanh((1.0 - weight) * actor_latent + weight * rule_values)
+        rule_unit = rule_values
+        return ((1.0 - weight) * actor_actions + weight * rule_unit).clamp(-1.0, 1.0)
 
     @torch.no_grad()
     def select_actions(self, driving_state, energy_state, deterministic=True):
@@ -129,20 +248,35 @@ class MADDPG:
         )
 
     def store_transition(self, state, joint_action, driving_reward, energy_reward,
-                         next_state, done):
+                         next_state, done, rule_values=None, rule_active=None,
+                         next_rule_values=None, next_rule_active=None):
         self.replay.add(
-            state, joint_action, [driving_reward, energy_reward], next_state, done
+            state, joint_action, [driving_reward, energy_reward], next_state, done,
+            rule_values, rule_active, next_rule_values, next_rule_active,
         )
 
     def update(self, batch_size):
-        state, joint_action, rewards, next_state, done = self.replay.sample(batch_size)
+        (
+            state, joint_action, rewards, next_state, done,
+            rule_values, rule_active, next_rule_values, next_rule_active,
+        ) = self.replay.sample(batch_size)
         next_driving_state = next_state[:, self.driving_observation_indices]
         next_energy_state = next_state[:, self.energy_observation_indices]
         with torch.no_grad():
-            next_joint_action = torch.cat((
-                self.target_actors["driving"](next_driving_state),
-                self.target_actors["energy"](next_energy_state),
-            ), dim=-1)
+            if self.rule_output_mode == "pre_tanh":
+                next_actor_action = torch.cat((
+                    self.target_actors["driving"].pre_tanh(next_driving_state),
+                    self.target_actors["energy"].pre_tanh(next_energy_state),
+                ), dim=-1)
+            else:
+                next_actor_action = torch.cat((
+                    self.target_actors["driving"](next_driving_state),
+                    self.target_actors["energy"](next_energy_state),
+                ), dim=-1)
+            next_joint_action = self._fuse_torch_actions(
+                next_actor_action, next_rule_values, next_rule_active,
+                actor_pre_tanh=self.rule_output_mode == "pre_tanh",
+            )
 
         critic_losses = {}
         for i, name in enumerate(("driving", "energy")):
@@ -159,17 +293,23 @@ class MADDPG:
             critic_losses[name] = loss.detach()
 
         actor_losses = {}
-        for name, other_name in (("driving", "energy"), ("energy", "driving")):
+        for name in ("driving", "energy"):
             driving_state = state[:, self.driving_observation_indices]
             energy_state = state[:, self.energy_observation_indices]
-            driving_action = self.actors["driving"](driving_state)
-            energy_action = self.actors["energy"](energy_state)
-            if name == "driving":
-                policy_joint_action = torch.cat((driving_action, energy_action.detach()), dim=-1)
-                own_action = driving_action
+            if self.rule_output_mode == "pre_tanh":
+                driving_action = self.actors["driving"].pre_tanh(driving_state)
+                energy_action = self.actors["energy"].pre_tanh(energy_state)
             else:
-                policy_joint_action = torch.cat((driving_action.detach(), energy_action), dim=-1)
-                own_action = energy_action
+                driving_action = self.actors["driving"](driving_state)
+                energy_action = self.actors["energy"](energy_state)
+            if name == "driving":
+                actor_joint_action = torch.cat((driving_action, energy_action.detach()), dim=-1)
+            else:
+                actor_joint_action = torch.cat((driving_action.detach(), energy_action), dim=-1)
+            policy_joint_action = self._fuse_torch_actions(
+                actor_joint_action, rule_values, rule_active,
+                actor_pre_tanh=self.rule_output_mode == "pre_tanh",
+            )
             critic = self.critics[name]
             for parameter in critic.parameters():
                 parameter.requires_grad_(False)
@@ -220,6 +360,10 @@ class MADDPG:
             },
             "update_count": self.update_count,
             "config": self.cfg,
+            "rule_output_mode": self.rule_output_mode,
+            "rule_lambda": self.rule_lambda,
+            "action_low": self.action_low,
+            "action_high": self.action_high,
             "reward_partition": {
                 "driving_actor": "driving_reward",
                 "energy_actor": "energy_reward",

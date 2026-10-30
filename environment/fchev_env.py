@@ -476,15 +476,88 @@ class FCHEVEnv(gym.Env):
         return bool(crossed)
 
     @staticmethod
-    def _crossed_red_light(tls_before, tls_after, ego_before, ego_after):
-        """Detect a signal crossing commanded while its link was red."""
-        return bool(
-            tls_before
-            and str(tls_before.get("state", "")).lower()[:1] == "r"
-            and FCHEVEnv._crossed_traffic_light(
-                tls_before, tls_after, ego_before, ego_after
-            )
+    def _traffic_light_state_at_crossing(
+        tls_before, tls_after, ego_before, ego_after, dt_s=1.0
+    ):
+        """Estimate the same-link signal state when SUMO crossed the stop line."""
+        if not tls_before or not tls_after:
+            return None, None
+        if str(tls_before.get("id")) != str(tls_after.get("id")):
+            return None, None
+        if not FCHEVEnv._crossed_traffic_light(
+            tls_before, tls_after, ego_before, ego_after
+        ):
+            return None, None
+
+        travel_m = max(
+            0.0,
+            float(ego_after["x_m"]) - float(ego_before["x_m"]),
         )
+        distance_m = max(0.0, float(tls_before.get("distance_m", 0.0)))
+        dt_s = float(dt_s)
+        crossing_time_s = None
+        if distance_m <= 1e-9:
+            crossing_time_s = 0.0
+        elif dt_s > 0.0:
+            speed_before = max(0.0, float(ego_before.get("speed_m_s", 0.0)))
+            speed_after = max(0.0, float(ego_after.get("speed_m_s", speed_before)))
+            accel_estimate = (speed_after - speed_before) / dt_s
+            if abs(accel_estimate) <= 1e-9:
+                if speed_before > 1e-9:
+                    candidate_time = distance_m / speed_before
+                    if candidate_time <= dt_s + 1e-9:
+                        crossing_time_s = candidate_time
+            else:
+                discriminant = (
+                    speed_before * speed_before
+                    + 2.0 * accel_estimate * distance_m
+                )
+                if discriminant >= 0.0:
+                    candidate_time = (
+                        -speed_before + float(np.sqrt(discriminant))
+                    ) / accel_estimate
+                    if -1e-9 <= candidate_time <= dt_s + 1e-9:
+                        crossing_time_s = float(np.clip(candidate_time, 0.0, dt_s))
+        if crossing_time_s is None:
+            crossing_fraction = (
+                0.0 if travel_m <= 1e-9
+                else float(np.clip(distance_m / travel_m, 0.0, 1.0))
+            )
+            crossing_time_s = crossing_fraction * dt_s
+
+        before_state = str(tls_before.get("state", ""))
+        state_at_crossing = before_state
+        try:
+            remaining_s = float(tls_before["remaining_s"])
+            # SUMO's post-step link state is the phase reached after the
+            # scheduled switch. Use it only when the switch occurred no later
+            # than the estimated crossing instant. At equality the new phase
+            # is active at the boundary.
+            if remaining_s <= crossing_time_s + 1e-9:
+                state_at_crossing = str(tls_after.get("state", before_state))
+        except (KeyError, TypeError, ValueError):
+            # Retain conservative behavior if timing metadata is unavailable.
+            pass
+        return state_at_crossing, crossing_time_s
+
+    @staticmethod
+    def _crossed_red_light(
+        tls_before, tls_after, ego_before, ego_after, dt_s=1.0
+    ):
+        """Detect whether a crossed stop line was red at the crossing instant.
+
+        ``tls_after`` must be a post-SUMO-step snapshot of the *same* signal
+        link as ``tls_before`` (not the next signal in the vehicle route). The
+        signal may change during the SUMO step, so the pre-step observation is
+        only valid at the crossing if its scheduled switch occurs after the
+        vehicle reaches the stop line.
+        """
+        state_at_crossing, _ = FCHEVEnv._traffic_light_state_at_crossing(
+            tls_before, tls_after, ego_before, ego_after, dt_s
+        )
+        if state_at_crossing is None:
+            return False
+        return state_at_crossing.strip().lower()[:1] == "r"
 
     def _inside_intersection_speed_zone(self, vehicle_state, tls, zone_length_m):
         if not self._intersection_speed_zone_enabled():
@@ -643,12 +716,36 @@ class FCHEVEnv(gym.Env):
                 and states_before["gap_m"] < NO_FRONT_GAP_M,
             )
         speed_entry_after = self._speed_limit_entry_metrics(states_after)
-        red_light_violation = self._crossed_red_light(
-            tls, states_after.get("next_tls"), ego0, ego1
-        )
         ego_tls_crossed = self._crossed_traffic_light(
             tls, states_after.get("next_tls"), ego0, ego1
         )
+        tls_after_for_crossing = None
+        tls_state_after_step = None
+        tls_state_at_crossing = None
+        tls_crossing_elapsed_s = None
+        red_light_violation = False
+        if ego_tls_crossed and tls is not None:
+            tls_state_after_step = self.sumo.traffic_light_link_state(
+                tls["id"], tls.get("link_index", 0)
+            )
+            # Keep a same-link snapshot. states_after['next_tls'] has already
+            # advanced to the following signal after the ego crosses this one.
+            tls_after_for_crossing = {
+                "id": str(tls["id"]),
+                "state": (
+                    tls_state_after_step
+                    if tls_state_after_step is not None
+                    else str(tls.get("state", ""))
+                ),
+            }
+            tls_state_at_crossing, tls_crossing_elapsed_s = (
+                self._traffic_light_state_at_crossing(
+                    tls, tls_after_for_crossing, ego0, ego1, self.dt
+                )
+            )
+            red_light_violation = self._crossed_red_light(
+                tls, tls_after_for_crossing, ego0, ego1, self.dt
+            )
         ego_crossed_tls_id = str(tls["id"]) if ego_tls_crossed and tls else None
         ego_new_tls_crossing = bool(
             ego_crossed_tls_id and ego_crossed_tls_id not in self._ego_passed_tls_ids
@@ -656,7 +753,9 @@ class FCHEVEnv(gym.Env):
         if ego_new_tls_crossing:
             self._ego_passed_tls_ids.add(ego_crossed_tls_id)
         green_light_crossing_bonus = green_light_crossing_reward(
-            tls.get("state", "") if tls else "",
+            tls_state_at_crossing
+            if tls_state_at_crossing is not None
+            else (tls.get("state", "") if tls else ""),
             ego_new_tls_crossing,
             self.config["reward"].get("green_light_crossing_bonus", 0.0),
         )
@@ -1068,6 +1167,12 @@ class FCHEVEnv(gym.Env):
             "requested_action_clipped": not np.array_equal(bounded, requested_raw),
             "driver_supervisor_override": False,
             "traffic_light": tls,
+            "traffic_light_state_before_crossing_step": (
+                str(tls.get("state", "")) if tls else None
+            ),
+            "traffic_light_state_after_crossing_step": tls_state_after_step,
+            "traffic_light_state_at_crossing": tls_state_at_crossing,
+            "traffic_light_crossing_elapsed_s": tls_crossing_elapsed_s,
             "traffic_light_state_observation": float(next_observation[9]),
             "traffic_light_distance_m": float(next_observation[10]),
             "traffic_light_remaining_s": float(next_observation[11]),
