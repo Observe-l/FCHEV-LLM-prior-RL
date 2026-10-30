@@ -1,463 +1,670 @@
-"""
-fcbev_follow_energy_prior.py
-
-Deterministic physical-action rule prior for the FCHEV/MADDPG interface.
-
-This program returns:
-  - driving.action: requested acceleration in [-1.5, 0.7] m/s^2
-  - energy.action: requested FCS output power in [0, 50] kW
-
-It does not replace the environment, does not add noise, and does not bypass
-physical constraints. The environment may still clip or modify the requested
-actions.
-"""
-
 import numpy as np
 
 
 # -----------------------------------------------------------------------------
-# Physical and task constants
+# Constants and physical approximations
 # -----------------------------------------------------------------------------
 
-A_MIN = -1.5
-A_MAX = 0.7
+_DT = 1.0
+_H = 12                         # finite horizon used by the rule: 12 s
+_ACTIONS = np.linspace(-1.5, 0.7, 23, dtype=np.float32)
 
-V_CAP = 19.4444          # 70 km/h hard vehicle cap, m/s
-MAIN_LIMIT = 16.6667     # ordinary road limit, m/s
-SENTINEL = 30000.0       # "no visible target / outside effective range"
+_SPEED_CAP = 70.0 / 3.6         # 19.444... m/s hard ego vehicle cap
+_NO_SIGNAL_DIST = 29999.0       # sentinel threshold for “no visible target”
 
-EPS = 1e-6
-SPEED_EPS = 1e-3
+# Traffic-light cycle:
+# state 0 = red, state 1 = green, state 2 = yellow
+# duration by state index: red=47 s, green=40 s, yellow=3 s
+# next phase order: red -> green -> yellow -> red
+_SIGNAL_DUR = np.array([47.0, 40.0, 3.0], dtype=np.float64)
+_SIGNAL_NEXT = np.array([1, 2, 0], dtype=np.int64)
 
-# Approximate vehicle-dynamics constants used only for an energy-demand estimate.
-M_EFF = 7000.0 * 1.05                         # rotational-mass-corrected mass
-DRAG_COEF = 0.5 * 1.225 * 0.55 * 5.8          # aerodynamic drag coefficient
-ROLL_FORCE = M_EFF * 9.8 * 0.0085             # rolling-resistance force
-ETA_EST = 0.88                                # approximate combined EDU+DC/DC efficiency
-SOC_GAIN_KW = 100.0                           # heuristic SOC-correction gain
+# Vehicle parameters from the project description.
+_MASS = 7000.0
+_ROTATIONAL_MASS_COEFF = 1.05
+_M_EFF = _MASS * _ROTATIONAL_MASS_COEFF
+
+_CRR = 0.0085
+_CD = 0.55
+_FRONT_AREA = 5.8
+_RHO = 1.225
+_G = 9.8
+
+# Approximate battery pack energy from nominal cell data:
+# 106 series * 3.3 V nominal, 134 parallel * 2.3 Ah nominal.
+_BATTERY_ENERGY_KWH = (106.0 * 3.3 * 134.0 * 2.3) / 1000.0
+_BATTERY_ENERGY_KWS = _BATTERY_ENERGY_KWH * 3600.0
+
+# Approximate 1C charge and 2C discharge power limits.
+_MAX_CHARGE_KW = _BATTERY_ENERGY_KWH
+_MAX_DISCHARGE_KW = 2.0 * _MAX_CHARGE_KW
+
+_SOC_MIN = 0.15
+_SOC_MAX = 0.9
+_SOC_TARGET = 0.5
+
+# SOC control is intentionally smoothed.  The pack energy is large, so a
+# strict one-horizon SOC correction would demand unrealistically large power.
+_SOC_DEADBAND = 0.005
+_SOC_CORRECTION_GAIN = 0.1
 
 
 # -----------------------------------------------------------------------------
-# Helper functions
+# Small helpers
 # -----------------------------------------------------------------------------
 
-def _clip_scalar(x, lo, hi):
-    return float(np.clip(x, lo, hi))
-
-
-def _as_2d(observation):
-    x = np.asarray(observation, dtype=np.float32)
-
-    if x.ndim == 1:
-        if x.size != 15:
-            raise ValueError("observation must be shape (15,) or (batch, 15)")
-        x = x.reshape(1, 15)
-    elif x.ndim == 2:
-        if x.shape[1] != 15:
-            raise ValueError("observation must be shape (15,) or (batch, 15)")
-    else:
-        raise ValueError("observation must be shape (15,) or (batch, 15)")
-
-    if not np.all(np.isfinite(x)):
-        raise ValueError("observation contains non-finite values")
-
-    return x
-
-
-def _signal_state_int(state):
+def _resistive_power(v):
     """
-    Raw signal encoding:
-      0 = red
-      1 = green
-      2 = yellow
+    Approximate road resistance power in kW.
+
+    This uses only speed and documented vehicle parameters.  It does not
+    include unknown EDU losses, driveline losses, accessory loads, or slope.
     """
-    if not np.isfinite(state):
-        return None
-
-    state = float(state)
-    if state < -0.5 or state > 2.5:
-        return None
-
-    st = int(np.floor(state + 0.5))
-    if st not in (0, 1, 2):
-        return None
-
-    return st
+    v = np.asarray(v, dtype=np.float64)
+    rolling = _CRR * _MASS * _G * v
+    drag = 0.5 * _RHO * _CD * _FRONT_AREA * v * v * v
+    return rolling + drag
 
 
-def _predict_signal_state(arrival, state, rem):
+def _electrical_demand(p_road, v):
     """
-    Predict the signal state at the estimated arrival time.
+    Convert wheel/mechanical power to an approximate electrical demand.
 
-    Uses the documented repeating cycle:
-      green 40 s, yellow 3 s, red 47 s, total 90 s.
-
-    Conservative convention:
-      Arrival exactly at a phase boundary is treated as the following
-      non-green phase, to avoid ambiguous yellow/red crossing.
+    Positive p_road means traction demand.  Negative p_road means regen.
+    The efficiency is a coarse approximation of the combined EDU boundary;
+    it is not a rated efficiency and does not add inverter/gearbox losses a
+    second time.
     """
-    if arrival <= EPS:
-        return state
+    p_road = np.asarray(p_road, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
 
-    if arrival < rem - EPS:
-        return state
+    out = np.zeros_like(p_road, dtype=np.float64)
 
-    t = max(0.0, arrival - rem)
+    pos = p_road > 1e-6
+    if np.any(pos):
+        p_norm = np.clip(p_road[pos] / 50.0, 0.0, 1.0)
+        v_norm = np.clip(v[pos] / 20.0, 0.0, 1.0)
 
-    if state == 1:
-        # Current green ends, then yellow 3 s, then red 47 s.
-        if t <= 3.0:
-            return 2
-        t -= 3.0
-        if t <= 47.0:
-            return 0
-        t -= 47.0
+        # Coarse total EDU efficiency approximation.
+        eta = 0.78 + 0.10 * p_norm + 0.04 * v_norm
+        eta = np.clip(eta, 0.75, 0.92)
 
-    elif state == 2:
-        # Current yellow ends, then red 47 s.
-        if t <= 47.0:
-            return 0
-        t -= 47.0
+        out[pos] = p_road[pos] / eta
 
-    # For state 0, current red ends after rem seconds; t is time after red end.
-    t = t % 90.0
+    neg = p_road < -1e-6
+    if np.any(neg):
+        # Coarse regen efficiency approximation.
+        out[neg] = p_road[neg] * 0.85
 
-    if t < 40.0:
-        return 1
-    if t < 43.0:
-        return 2
-    return 0
+    return out
 
 
-def _traffic_accel_cap(ego_v, dist, state, rem):
+def _signal_is_green_at_time(state, remaining, t, no_signal):
     """
-    Return an acceleration cap imposed by the traffic light, or None if no cap.
+    Return True if the next traffic light would be green at predicted time t.
 
-    The cap is conservative:
-      - If the predicted crossing state is green, no cap is imposed.
-      - If the predicted crossing state is yellow or red, the rule requests a
-        non-positive acceleration sufficient to slow before the stop line.
-      - If the ego is at the stop line and the signal is not clearly green,
-        the cap is negative if moving, otherwise zero.
+    Only the current state, current remaining phase time, and the fixed cycle
+    are used.  t is limited to the rule horizon.  This does not extrapolate
+    beyond the horizon.
     """
-    st = _signal_state_int(state)
-    if st is None:
-        return None
+    state = np.clip(np.round(state).astype(np.int64), 0, 2)
+    remaining = np.clip(remaining, 0.0, 100.0)
+    t = np.clip(t, 0.0, _H + 1.0)
 
-    if not np.isfinite(dist) or dist >= SENTINEL:
-        return None
+    cur = state.copy()
+    rem = remaining.copy()
+    tt = t.copy()
 
-    dist = max(0.0, float(dist))
+    # The horizon is 12 s, so a few phase advances are enough.
+    for _ in range(6):
+        mask = tt >= rem
+        if not np.any(mask):
+            break
 
-    if not np.isfinite(rem):
-        rem = 0.0
-    rem = max(0.0, float(rem))
+        tt = np.where(mask, tt - rem, tt)
+        cur = np.where(mask, _SIGNAL_NEXT[cur], cur)
+        rem = np.where(mask, _SIGNAL_DUR[cur], rem)
 
-    # At the stop line.
-    if dist == 0.0:
-        if st == 1 and rem > EPS:
-            return None
-        return A_MIN if ego_v > SPEED_EPS else 0.0
-
-    # Stopped before the line.
-    if ego_v <= SPEED_EPS:
-        if st == 1:
-            # Check whether the ego could reach the stop line before green ends
-            # using the maximum available acceleration.
-            max_reach = ego_v * rem + 0.5 * A_MAX * rem * rem
-            if max_reach + 0.5 >= dist:
-                return None
-            return 0.0
-        return 0.0
-
-    arrival = dist / ego_v
-    pred = _predict_signal_state(arrival, st, rem)
-
-    if pred == 1:
-        return None
-
-    # Conservative stop-before-line deceleration estimate.
-    a_stop = -(ego_v * ego_v) / (2.0 * dist)
-    return float(max(A_MIN, min(0.0, a_stop)))
+    green = cur == 1
+    return np.where(no_signal, True, green)
 
 
-def _speed_cap(ego_v, cur_limit):
+# -----------------------------------------------------------------------------
+# Driving prior
+# -----------------------------------------------------------------------------
+
+def _drive_prior(obs):
     """
-    1-step speed-limit cap.
+    Physical driving prior: requested acceleration in [-1.5, 0.7] m/s^2.
 
-    This is not a target-speed command. It limits the requested acceleration so
-    that the next-step speed is not allowed to exceed the current posted limit.
+    The rule evaluates a small deterministic candidate grid over a finite
+    horizon and selects the candidate with the lowest approximate cost.
     """
-    allowed = cur_limit - ego_v
-    if allowed >= 0.0:
-        return float(min(A_MAX, allowed))
-    return float(max(A_MIN, allowed))
+    x = obs
+    B = x.shape[0]
 
+    if B == 0:
+        return np.empty((0, 1), dtype=np.float32)
 
-def _entry_cap(ego_v, cur_limit, next_limit, next_dist):
-    """
-    Kinematic cap for approaching a lower posted-speed region.
+    C = _ACTIONS.shape[0]
 
-    Uses a 1-step look-ahead approximation:
-      v_entry^2 ~= v^2 + 2 a d_entry
+    # Raw observation extraction.
+    a_cur = np.clip(x[:, 4], -1.5, 0.7).astype(np.float64)
+    v0 = np.clip(x[:, 5], 0.0, _SPEED_CAP).astype(np.float64)
+    a_lead = np.clip(x[:, 6], -5.0, 5.0).astype(np.float64)
+    v_lead = np.clip(x[:, 7], 0.0, 30.0).astype(np.float64)
+    gap0 = np.clip(x[:, 8], 0.0, 30000.0).astype(np.float64)
 
-    This is a soft prior cap, not an exact reward reproduction.
-    """
-    if next_limit >= cur_limit - 1e-3 or next_dist >= SENTINEL:
-        return None
+    signal = np.clip(np.round(x[:, 9]), 0, 2).astype(np.float64)
+    stop0 = np.clip(x[:, 10], -30000.0, 30000.0).astype(np.float64)
+    phase0 = np.clip(x[:, 11], 0.0, 100.0).astype(np.float64)
 
-    d = max(0.0, float(next_dist))
+    limit0 = np.clip(x[:, 12], 0.1, 30.0).astype(np.float64)
+    limit1 = np.clip(x[:, 13], 0.1, 30.0).astype(np.float64)
+    entry0 = np.clip(x[:, 14], 0.0, 30000.0).astype(np.float64)
 
-    if d <= EPS:
-        if ego_v > next_limit + 1e-3:
-            return A_MIN
-        return 0.0
+    b_soh = np.clip(x[:, 1], 0.0, 1.0).astype(np.float64)
+    fcs_soh = np.clip(x[:, 2], 0.0, 1.0).astype(np.float64)
+    edu_soh = np.clip(x[:, 3], 0.0, 1.0).astype(np.float64)
 
-    cap = (next_limit * next_limit - ego_v * ego_v) / (2.0 * d)
-    return float(max(A_MIN, min(A_MAX, cap)))
+    # Broadcast observation fields to candidate dimension.
+    v0b = v0[:, None]
+    a_leadb = a_lead[:, None]
+    v_leadb = v_lead[:, None]
+    gap0b = gap0[:, None]
+    stop0b = stop0[:, None]
+    limit0b = limit0[:, None]
+    limit1b = limit1[:, None]
+    entry0b = entry0[:, None]
+    signalb = signal[:, None]
+    phase0b = phase0[:, None]
+    a_cur_b = a_cur[:, None]
 
+    b_soh_b = b_soh[:, None]
+    fcs_soh_b = fcs_soh[:, None]
+    edu_soh_b = edu_soh[:, None]
 
-def _desired_acceleration(row):
-    """
-    Driving prior:
-      - follow the live lead vehicle,
-      - keep gap between D_safe and D_max whenever possible,
-      - obey current and upcoming posted speed limits,
-      - respect traffic-light crossing constraints,
-      - apply only mild comfort smoothing in a safe steady-following band.
-    """
-    ego_v = _clip_scalar(row[5], 0.0, V_CAP)
-    lead_v = _clip_scalar(row[7], 0.0, V_CAP)
-    lead_a = _clip_scalar(row[6], A_MIN, A_MAX)
-    ego_a = _clip_scalar(row[4], A_MIN, A_MAX)
+    a_grid = _ACTIONS.reshape(1, C).astype(np.float64)
 
-    gap = float(row[8])
-    if not np.isfinite(gap):
-        gap = SENTINEL
+    # Candidate simulation state.
+    ego_v = np.broadcast_to(v0b, (B, C)).copy()
+    lead_v = np.broadcast_to(v_leadb, (B, C)).copy()
+    ego_pos = np.zeros((B, C), dtype=np.float64)
+    lead_pos = np.zeros((B, C), dtype=np.float64)
 
-    if gap < 0.0:
-        gap_eff = 0.0
-    elif gap >= SENTINEL:
-        gap_eff = SENTINEL
-    else:
-        gap_eff = gap
+    # Used for the conservative one-step-earlier speed-region check.
+    prev_v = ego_v.copy()
 
-    cur_limit = float(row[12])
-    if not np.isfinite(cur_limit) or cur_limit <= 0.0:
-        cur_limit = MAIN_LIMIT
-    cur_limit = min(cur_limit, V_CAP)
+    no_signal = stop0b >= _NO_SIGNAL_DIST
+    crossed = no_signal | (stop0b < -1e-3)
 
-    next_limit = float(row[13])
-    if not np.isfinite(next_limit) or next_limit <= 0.0:
-        next_limit = cur_limit
-    next_limit = min(next_limit, V_CAP)
+    valid_entry = (entry0b < _NO_SIGNAL_DIST) & (np.abs(limit1b - limit0b) > 1e-3)
+    lower_entry = valid_entry & (limit1b < limit0b - 1e-3)
+    entry_done = (~valid_entry) | (entry0b <= 1e-3)
 
-    next_dist = float(row[14])
-    if not np.isfinite(next_dist):
-        next_dist = SENTINEL
+    gap_valid = gap0b < _NO_SIGNAL_DIST
 
-    # Following-distance bounds consistent with the documented reward model.
-    d_safe = 2.0 + 0.5 * ego_v + 0.0625 * ego_v * ego_v
-    d_max = 10.0 + ego_v + 0.0825 * ego_v * ego_v
-    target_gap = d_safe + 0.5 * (d_max - d_safe)
+    total_cost = np.zeros((B, C), dtype=np.float64)
+    invalid_cross = np.zeros((B, C), dtype=bool)
 
-    # Simple following controller:
-    # lead-acceleration feedforward + gap error + relative-speed correction.
-    k_gap = 0.03
-    k_rel = 0.35
-    a_follow = (
-        lead_a
-        + k_gap * (gap_eff - target_gap)
-        + k_rel * (lead_v - ego_v)
+    for step in range(1, _H + 1):
+        ego_v_prev = ego_v
+        lead_v_prev = lead_v
+        prev_prev_v = prev_v
+
+        # Conservative within-step motion approximation.
+        ego_v_step = np.maximum(0.0, ego_v_prev + 0.5 * a_grid * _DT)
+        ego_v_step = np.minimum(ego_v_step, _SPEED_CAP)
+
+        lead_v_step = np.maximum(0.0, lead_v_prev + 0.5 * a_leadb * _DT)
+        lead_v_step = np.minimum(lead_v_step, 30.0)
+
+        ego_pos_after = ego_pos + ego_v_step * _DT
+        lead_pos_after = lead_pos + lead_v_step * _DT
+
+        # End-of-step speeds.  The environment enforces no reverse and the
+        # hard 70 km/h cap.  The rule approximates those effects.
+        ego_v_after = np.maximum(0.0, ego_v_prev + a_grid * _DT)
+        ego_v_after = np.minimum(ego_v_after, _SPEED_CAP)
+
+        lead_v_after = np.maximum(0.0, lead_v_prev + a_leadb * _DT)
+        lead_v_after = np.minimum(lead_v_after, 30.0)
+
+        gap_after = gap0b + lead_pos_after - ego_pos_after
+        gap_after = np.clip(gap_after, 0.0, 30000.0)
+
+        # -----------------------------------------------------------------
+        # Speed-region entry.  If a lower-limit region is crossed, check the
+        # nominal entry speed and the conservative one-step-earlier speed.
+        # -----------------------------------------------------------------
+        entry_cross = (
+            (~entry_done)
+            & valid_entry
+            & (ego_pos < entry0b - 1e-3)
+            & (ego_pos_after >= entry0b - 1e-3)
+        )
+
+        entry_speed = np.maximum(prev_prev_v, ego_v_prev)
+
+        entry_cost = np.where(
+            entry_cross & lower_entry,
+            500.0 * np.maximum(0.0, (entry_speed - limit1b) / np.maximum(limit1b, 1.0)),
+            0.0,
+        )
+        entry_cost = np.where(
+            entry_cross & lower_entry & (entry_speed >= 1.2 * limit1b),
+            entry_cost + 1.0e5,
+            entry_cost,
+        )
+
+        entry_done_after = entry_done | entry_cross
+        limit_eff = np.where(entry_done_after, limit1b, limit0b)
+
+        # -----------------------------------------------------------------
+        # Posted speed-limit cost.  The hard 70 km/h cap is already applied
+        # to ego_v_after.  The 120% termination threshold is penalized.
+        # -----------------------------------------------------------------
+        speed_excess = np.maximum(0.0, ego_v_after - limit_eff)
+        speed_cost = 100.0 * speed_excess / np.maximum(limit_eff, 1.0)
+        speed_cost = np.where(
+            ego_v_after >= 1.2 * limit_eff,
+            speed_cost + 1.0e5,
+            speed_cost,
+        )
+
+        # -----------------------------------------------------------------
+        # Following cost.  Primary objective: keep gap between D_safe and
+        # D_max whenever feasible.  Too-small gaps and overlap are heavily
+        # penalized.  Excessive gaps are penalized to encourage catch-up.
+        # -----------------------------------------------------------------
+        v_for_dist = ego_v_after
+
+        D_safe = 2.0 + 0.5 * v_for_dist + 0.0625 * v_for_dist * v_for_dist
+        D_max = 10.0 + v_for_dist + 0.0825 * v_for_dist * v_for_dist
+
+        gap_cost = np.zeros((B, C), dtype=np.float64)
+
+        collision = gap_valid & (gap_after <= 1e-3)
+        gap_cost = np.where(collision, 1.0e6, gap_cost)
+
+        below = gap_valid & (gap_after > 1e-3) & (gap_after < D_safe)
+        gap_cost = np.where(
+            below,
+            gap_cost + 1000.0 * (D_safe - gap_after) / np.maximum(D_safe, 1.0),
+            gap_cost,
+        )
+
+        above = gap_valid & (gap_after > D_max)
+        gap_cost = np.where(
+            above,
+            gap_cost
+            + 5.0 * np.minimum(100.0, gap_after - D_max)
+            + 20.0 * np.minimum(100.0, np.maximum(0.0, gap_after - 200.0)),
+            gap_cost,
+        )
+
+        # -----------------------------------------------------------------
+        # Traffic-light arrival penalty.  If the next stop line would be
+        # reached within the horizon before the current phase ends and the
+        # current phase is not green, add a small penalty.  The hard green-only
+        # crossing check is applied separately below.
+        # -----------------------------------------------------------------
+        t1 = np.where(
+            ego_v_after > 0.1,
+            stop0b / np.maximum(ego_v_after, 0.1),
+            1.0e9,
+        )
+
+        bad_arrival = (
+            (~no_signal)
+            & (~crossed)
+            & (ego_v_after > 0.1)
+            & (t1 <= _H)
+            & (t1 < phase0b)
+            & (signalb != 1)
+        )
+
+        traffic_cost = np.where(bad_arrival, 5.0, 0.0)
+
+        # -----------------------------------------------------------------
+        # Hard green-only crossing check.
+        #
+        # For any candidate predicted to reach the stop line within the
+        # horizon, the nominal crossing time and a conservative one-step-
+        # earlier crossing time are evaluated.  If either is not green, the
+        # candidate receives a large penalty.
+        # -----------------------------------------------------------------
+        rem_before = stop0b - ego_pos
+        moved_forward = ego_pos_after > ego_pos + 1e-3
+
+        crossed_now = (
+            (~crossed)
+            & (~no_signal)
+            & (rem_before <= 1e-3)
+            & (moved_forward | (ego_v_prev > 1e-3))
+        )
+
+        crossed_during = (
+            (~crossed)
+            & (~crossed_now)
+            & (~no_signal)
+            & (rem_before > 1e-3)
+            & (ego_pos_after >= stop0b - 1e-3)
+        )
+
+        crossed_mask = crossed_now | crossed_during
+
+        if np.any(crossed_mask):
+            t_cross = np.where(
+                crossed_now,
+                float(step - 1),
+                (step - 1) + rem_before / np.maximum(ego_v_step, 1e-3),
+            )
+            t_cross = np.clip(t_cross, 0.0, float(_H))
+
+            # Conservative earlier-arrival case: one simulation step earlier.
+            t_early = np.maximum(0.0, t_cross - 1.0)
+
+            green_nom = _signal_is_green_at_time(
+                signalb, phase0b, t_cross, no_signal
+            )
+            green_early = _signal_is_green_at_time(
+                signalb, phase0b, t_early, no_signal
+            )
+
+            invalid_cross = invalid_cross | (
+                crossed_mask & (~green_nom | ~green_early)
+            )
+
+        crossed = crossed | crossed_mask
+
+        # -----------------------------------------------------------------
+        # Comfort and component-health regularization.
+        #
+        # These terms are small compared with following, speed, and signal
+        # costs.  They gently discourage abrupt acceleration and high positive
+        # acceleration when component SOH is already low.
+        # -----------------------------------------------------------------
+        comfort_cost = 0.2 * np.abs(a_grid - a_cur_b)
+
+        health_cost = (
+            0.15 * (1.0 - b_soh_b)
+            + 0.15 * (1.0 - fcs_soh_b)
+            + 0.30 * (1.0 - edu_soh_b)
+        ) * np.maximum(0.0, a_grid)
+
+        total_cost += (
+            gap_cost
+            + speed_cost
+            + entry_cost
+            + traffic_cost
+            + comfort_cost
+            + health_cost
+        )
+
+        # Advance candidate simulation state.
+        ego_pos = ego_pos_after
+        lead_pos = lead_pos_after
+        ego_v = ego_v_after
+        lead_v = lead_v_after
+        prev_v = ego_v_prev
+        entry_done = entry_done_after
+
+    # Penalize candidates that would cross a red or yellow stop line.
+    total_cost = np.where(invalid_cross, total_cost + 1.0e6, total_cost)
+
+    # Small tie-breakers.  They do not change the main objective hierarchy.
+    total_cost += 0.01 * np.abs(a_grid)
+    total_cost += 0.001 * np.abs(a_grid - a_cur_b)
+
+    total_cost = np.nan_to_num(
+        total_cost,
+        nan=1.0e9,
+        posinf=1.0e9,
+        neginf=1.0e9,
     )
 
-    speed_cap = _speed_cap(ego_v, cur_limit)
-    entry_cap = _entry_cap(ego_v, cur_limit, next_limit, next_dist)
-    tcap = _traffic_accel_cap(ego_v, row[10], row[9], row[11])
+    idx = np.argmin(total_cost, axis=1)
+    a_out = _ACTIONS[idx].astype(np.float64)
 
-    a_candidate = min(a_follow, speed_cap)
+    # ---------------------------------------------------------------------
+    # Post-processing safety filters.
+    #
+    # These filters do not bypass the environment.  They only keep the rule
+    # request consistent with the posted limit, hard speed cap, and minimum
+    # safe gap.  Negative requests are not forced to zero at low speed; the
+    # environment handles the no-reverse clipping.
+    # ---------------------------------------------------------------------
 
-    if entry_cap is not None:
-        a_candidate = min(a_candidate, entry_cap)
-
-    if tcap is not None:
-        a_candidate = min(a_candidate, tcap)
-
-    # If the gap is already unsafe and the ego is not clearly slower than the
-    # lead, do not request positive acceleration.
-    if gap_eff < d_safe and ego_v > lead_v - 0.5:
-        a_candidate = min(a_candidate, 0.0)
-
-    # Mild comfort smoothing only when following is already safe, steady, and
-    # not constrained by speed-limit entry or traffic-light crossing logic.
-    comfort_band = (
-        gap_eff >= d_safe
-        and gap_eff <= d_max
-        and abs(ego_v - lead_v) <= 1.0
-        and tcap is None
-        and ego_v < cur_limit - 0.2
-        and (next_limit >= cur_limit - 1e-3 or ego_v < next_limit - 0.2)
+    # Do not request positive acceleration at the hard vehicle cap.
+    a_out = np.where(
+        v0 >= _SPEED_CAP - 0.05,
+        np.minimum(a_out, 0.0),
+        a_out,
     )
 
-    if comfort_band:
-        max_delta = 0.20
-        a_candidate = ego_a + np.clip(a_candidate - ego_a, -max_delta, max_delta)
+    # Do not request positive acceleration when already at or above the
+    # current posted limit.
+    a_out = np.where(
+        v0 >= limit0 - 0.05,
+        np.minimum(a_out, 0.0),
+        a_out,
+    )
 
-    # Reapply hard road/physical caps after smoothing.
-    speed_cap = _speed_cap(ego_v, cur_limit)
-    a_candidate = min(a_candidate, speed_cap)
+    # If already above the 120% termination threshold region, request braking.
+    a_out = np.where(
+        v0 >= 1.1 * limit0,
+        np.minimum(a_out, -0.25),
+        a_out,
+    )
 
-    if entry_cap is not None:
-        a_candidate = min(a_candidate, entry_cap)
+    # Protect the minimum safe gap.
+    D_safe_cur = 2.0 + 0.5 * v0 + 0.0625 * v0 * v0
+    too_close = (gap0 < _NO_SIGNAL_DIST) & (gap0 < D_safe_cur)
 
-    if tcap is not None:
-        a_candidate = min(a_candidate, tcap)
+    a_out = np.where(
+        too_close & (a_out > 0.0),
+        np.minimum(a_out, -0.25),
+        a_out,
+    )
 
-    return _clip_scalar(a_candidate, A_MIN, A_MAX)
+    very_close = too_close & (gap0 < 0.5 * D_safe_cur)
+    a_out = np.where(
+        very_close & (a_out > -0.5),
+        np.minimum(a_out, -0.5),
+        a_out,
+    )
+
+    a_out = np.clip(a_out, -1.5, 0.7).astype(np.float32)
+    return a_out.reshape(-1, 1)
 
 
-def _estimate_mech_power_kw(v, a_est):
+# -----------------------------------------------------------------------------
+# Energy prior
+# -----------------------------------------------------------------------------
+
+def _energy_prior(obs, driving_action):
     """
-    Approximate mechanical power demand at the wheel/drive-unit boundary.
+    Physical energy prior: requested FCS output power in [0, 50] kW.
 
-    This is an estimate only. It uses the documented vehicle parameters and a
-    single approximate efficiency value. It does not use the exact EPA IPM EDU
-    map, exact EDU torque-speed operating regions, exact FCS hydrogen table,
-    exact battery electrothermal model, or actual energy-dispatch state.
+    This is not battery power.  It is a requested FCS output power.  The
+    environment may clip or modify the request due to battery, EDU, and FCS
+    feasibility limits.
     """
-    v = _clip_scalar(v, 0.0, V_CAP)
-    a = _clip_scalar(a_est, A_MIN, A_MAX)
+    x = obs
+    B = x.shape[0]
 
-    inertial = M_EFF * a * v
-    resistive = (DRAG_COEF * v * v + ROLL_FORCE) * v
-    p_mech = inertial + resistive
+    if B == 0:
+        return np.empty((0, 1), dtype=np.float32)
 
-    if p_mech <= 0.0:
-        # Negative mechanical power is treated as regeneration potential.
-        # The energy prior then prefers low or zero FCS request.
-        return 0.0
+    soc = np.clip(x[:, 0], _SOC_MIN, _SOC_MAX).astype(np.float64)
+    b_soh = np.clip(x[:, 1], 0.0, 1.0).astype(np.float64)
+    fcs_soh = np.clip(x[:, 2], 0.0, 1.0).astype(np.float64)
+    edu_soh = np.clip(x[:, 3], 0.0, 1.0).astype(np.float64)
 
-    # Approximate combined efficiency. This is not a rated efficiency claim.
-    return float(p_mech / (ETA_EST * 1000.0))
+    a_cur = np.clip(x[:, 4], -1.5, 0.7).astype(np.float64)
+    v = np.clip(x[:, 5], 0.0, _SPEED_CAP).astype(np.float64)
+
+    a_rule = np.clip(driving_action.reshape(-1), -1.5, 0.7).astype(np.float64)
+
+    # ---------------------------------------------------------------------
+    # Estimate future electrical demand using the driving prior trajectory.
+    #
+    # The rule does not have direct access to motor torque, instantaneous EDU
+    # loss, battery power, hydrogen consumption, or actual FCS power.  The
+    # following is an approximation based only on speed, acceleration, and
+    # documented vehicle parameters.
+    # ---------------------------------------------------------------------
+    pred_v = v.copy()
+    p_load_sum = np.zeros(B, dtype=np.float64)
+
+    for _ in range(_H):
+        v_prev = pred_v
+
+        # Approximate environment no-reverse clipping.
+        a_exec = np.maximum(a_rule, -v_prev / _DT)
+
+        # Do not request positive traction power at the hard speed cap.
+        a_exec = np.where(
+            (v_prev >= _SPEED_CAP - 1e-3) & (a_exec > 0.0),
+            0.0,
+            a_exec,
+        )
+
+        p_road = _resistive_power(v_prev) + _M_EFF * a_exec * v_prev
+        p_load_sum += _electrical_demand(p_road, v_prev)
+
+        v_next = v_prev + a_exec * _DT
+        pred_v = np.maximum(0.0, np.minimum(_SPEED_CAP, v_next))
+
+    p_load_pred = p_load_sum / _H
+
+    # Current demand is weighted with the predicted demand so the energy prior
+    # reacts to the present step while still using the prediction horizon.
+    p_load_cur = _electrical_demand(
+        _resistive_power(v) + _M_EFF * a_cur * v,
+        v,
+    )
+    p_load_ref = 0.35 * p_load_cur + 0.65 * p_load_pred
+
+    # ---------------------------------------------------------------------
+    # SOH-based conservative limits.
+    #
+    # These are not exact degradation models.  They are simple health caps:
+    # low FCS SOH reduces the maximum FCS request; low battery SOH reduces
+    # allowed battery power; low EDU SOH applies only a mild cap because the
+    # energy actor cannot directly change EDU mechanical demand.
+    # ---------------------------------------------------------------------
+    b_scale = np.clip(0.5 + 0.5 * b_soh, 0.5, 1.0)
+    f_scale = np.clip(0.5 + 0.5 * fcs_soh, 0.5, 1.0)
+    edu_scale = np.clip(0.85 + 0.15 * edu_soh, 0.85, 1.0)
+
+    max_fcs = np.clip(50.0 * f_scale * edu_scale, 0.0, 50.0)
+    max_discharge = _MAX_DISCHARGE_KW * b_scale
+    max_charge = _MAX_CHARGE_KW * b_scale
+
+    # ---------------------------------------------------------------------
+    # SOC regulation.
+    #
+    # Desired battery power over the horizon:
+    #   P_batt_target = P_fcs - P_load
+    # so:
+    #   P_fcs_target = P_load + P_batt_target.
+    #
+    # A deadband and gain are used to avoid aggressive high-rate SOC
+    # correction, because the pack energy is large and the rule is recomputed
+    # every step.
+    # ---------------------------------------------------------------------
+    soc_err = _SOC_TARGET - soc
+    soc_err = np.where(np.abs(soc_err) <= _SOC_DEADBAND, 0.0, soc_err)
+
+    p_soc_target = soc_err * _BATTERY_ENERGY_KWS * _SOC_CORRECTION_GAIN / _H
+    p_soc_target = np.clip(p_soc_target, -max_discharge, max_charge)
+
+    p_req = p_load_ref + p_soc_target
+
+    # Battery feasibility approximation.
+    # If battery discharge would exceed the approximate limit, raise FCS request.
+    p_req = np.maximum(p_req, p_load_ref - max_discharge)
+
+    # If battery charge would exceed the approximate limit, lower FCS request.
+    p_req = np.minimum(p_req, p_load_ref + max_charge)
+
+    # FCS request cannot exceed the health-scaled maximum.
+    p_req = np.minimum(p_req, max_fcs)
+
+    # Physical request bounds.
+    p_req = np.clip(p_req, 0.0, 50.0)
+
+    # ---------------------------------------------------------------------
+    # Very low FCS output avoidance.
+    #
+    # This is an approximation intended to reduce hydrogen use and possible
+    # low-power/startup-related FCS degradation when the battery is healthy
+    # and SOC is not dangerously low.  It is not a validated degradation model.
+    # ---------------------------------------------------------------------
+    low_power = (
+        (p_req > 0.0)
+        & (p_req < 5.0)
+        & (soc > _SOC_MIN + 0.05)
+        & (b_soh > 0.90)
+    )
+    p_req = np.where(low_power, 0.0, p_req)
+
+    p_req = np.clip(p_req, 0.0, 50.0).astype(np.float32)
+    return p_req.reshape(-1, 1)
 
 
-def _energy_power_kw(row, a_est):
-    """
-    Energy prior:
-      - estimate mechanical demand from ego speed and the rule's driving prior,
-      - move requested FCS power toward the SOC target of 0.5,
-      - reduce requested FCS power when SOC is high or the vehicle is braking,
-      - cap requested FCS power when FCS/EDU/battery SOH is low,
-      - keep the requested FCS output power within [0, 50] kW.
-    """
-    soc = _clip_scalar(row[0], 0.15, 0.90)
-    batt_soh = _clip_scalar(row[1], 0.0, 1.0)
-    fcs_soh = _clip_scalar(row[2], 0.0, 1.0)
-    edu_soh = _clip_scalar(row[3], 0.0, 1.0)
-    v = _clip_scalar(row[5], 0.0, V_CAP)
-
-    demand = _estimate_mech_power_kw(v, a_est)
-
-    # Heuristic requested-power caps based on component health.
-    max_fcs = 50.0
-    max_fcs = min(max_fcs, 50.0 * max(0.5, fcs_soh))
-    max_fcs = min(max_fcs, 50.0 * max(0.5, edu_soh))
-
-    # If SOC is already high and battery SOH is reduced, avoid requesting
-    # excess FCS power that could increase charging stress.
-    if soc > 0.55:
-        max_fcs = min(max_fcs, 50.0 * max(0.5, batt_soh))
-
-    # SOC-management correction.
-    # SOC > 0.5 reduces requested FCS power.
-    # SOC < 0.5 increases requested FCS power.
-    p = demand - SOC_GAIN_KW * (soc - 0.5)
-
-    # If demand exceeds the health-limited FCS request and SOC is not high,
-    # request the maximum allowed FCS power to reduce battery discharge.
-    if demand > max_fcs and soc < 0.60:
-        p = max(p, max_fcs)
-
-    # Low-demand logic.
-    if demand <= 1.0:
-        if soc <= 0.45:
-            # SOC below target: allow a small charging request.
-            p = max(p, 5.0)
-        elif soc >= 0.55:
-            # SOC above target: prefer no FCS request.
-            p = 0.0
-        else:
-            # Near target: keep request small.
-            p = min(max(p, 0.0), 5.0)
-
-    # During braking, if SOC is not very low, keep FCS request low to favor
-    # regeneration and lower hydrogen use.
-    if a_est < -0.2 and soc > 0.45:
-        p = min(p, 0.0)
-
-    # If SOC is very low and components are reasonably healthy, ensure at least
-    # a modest charging request.
-    if soc <= 0.25 and p < 10.0 and batt_soh > 0.7 and fcs_soh > 0.7:
-        p = max(p, 10.0)
-
-    # If SOC is already high and demand is low, request no FCS power.
-    if soc >= 0.75 and demand < 5.0:
-        p = 0.0
-
-    # Final physical request bounds.
-    p = _clip_scalar(p, 0.0, max_fcs)
-
-    # Remove tiny nonzero requests when there is essentially no demand and SOC
-    # is not below target. This reduces unnecessary load changes in the prior.
-    if p < 1.0 and demand < 1.0 and soc > 0.5:
-        p = 0.0
-
-    return float(p)
-
+# -----------------------------------------------------------------------------
+# Required rule interface
+# -----------------------------------------------------------------------------
 
 def predict(observation):
     """
-    Required rule-program entry point.
+    FCHEV rule prior.
 
-    Accepts:
-      - observation with shape (15,), or
-      - batched observation with shape (batch, 15).
+    Input:
+        Raw unnormalized observation, shape (15,) or (batch, 15).
 
-    Returns:
-      {
-        "driving": {"action": (batch, 1) float32 acceleration m/s^2,
-                    "active": (batch, 1) bool},
-        "energy":  {"action": (batch, 1) float32 FCS power kW,
-                    "active": (batch, 1) bool}
-      }
+    Output:
+        Physical action priors:
+            driving.action: requested acceleration in [-1.5, 0.7] m/s^2
+            energy.action:  requested FCS output power in [0, 50] kW
 
-    Both actors are active on every observation.
+        active masks are always True for both actors.
     """
-    x = _as_2d(observation)
-    n = x.shape[0]
+    x = np.asarray(observation, dtype=np.float32)
 
-    accel = np.empty((n, 1), dtype=np.float32)
-    power = np.empty((n, 1), dtype=np.float32)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
 
-    for i in range(n):
-        row = x[i]
+    if x.ndim != 2 or x.shape[1] != 15 or not np.all(np.isfinite(x)):
+        raise ValueError(
+            "observation must be finite with shape (15,) or (batch, 15)"
+        )
 
-        a = _desired_acceleration(row)
-        p = _energy_power_kw(row, a)
+    batch_size = x.shape[0]
 
-        accel[i, 0] = np.float32(a)
-        power[i, 0] = np.float32(p)
+    if batch_size == 0:
+        empty_action = np.empty((0, 1), dtype=np.float32)
+        empty_mask = np.empty((0, 1), dtype=bool)
+        return {
+            "driving": {"action": empty_action, "active": empty_mask},
+            "energy": {"action": empty_action, "active": empty_mask},
+        }
 
-    active_driving = np.ones((n, 1), dtype=bool)
-    active_energy = np.ones((n, 1), dtype=bool)
+    driving_action = _drive_prior(x)
+    energy_action = _energy_prior(x, driving_action)
+
+    active = np.ones((batch_size, 1), dtype=bool)
 
     return {
         "driving": {
-            "action": accel,
-            "active": active_driving,
+            "action": driving_action.astype(np.float32),
+            "active": active,
         },
         "energy": {
-            "action": power,
-            "active": active_energy,
+            "action": energy_action.astype(np.float32),
+            "active": active,
         },
     }
