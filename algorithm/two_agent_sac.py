@@ -14,7 +14,9 @@ class TwoAgentSAC:
 
     def __init__(self, config, seed=0):
         self.driving = SAC(state_dim=11, action_dim=1, config=config, seed=seed)
-        self.energy = SAC(state_dim=5, action_dim=1, config=config, seed=seed + 1)
+        # Match the current MADDPG energy observation: measured ego
+        # acceleration, ego speed, SOC, battery SOH, FCS SOH, and EDU SOH.
+        self.energy = SAC(state_dim=6, action_dim=1, config=config, seed=seed + 1)
 
     @property
     def device(self):
@@ -39,8 +41,8 @@ class TwoAgentSAC:
                     "distance_to_next_speed_region_m",
                 ],
                 "energy": [
-                    "measured_executed_acceleration_m_s2", "battery_soc",
-                    "battery_soh", "fcs_soh", "edu_soh",
+                    "measured_executed_acceleration_m_s2", "ego_speed_m_s",
+                    "battery_soc", "battery_soh", "fcs_soh", "edu_soh",
                 ],
             },
             "reward_partition": {

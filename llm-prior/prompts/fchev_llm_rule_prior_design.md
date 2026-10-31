@@ -1,86 +1,85 @@
-你是熟悉强化学习、SAC/HASAC、车辆纵向控制和燃料电池混合动力汽车（FCHEV）能量管理的工程师。请根据下述项目接口，为 FCHEV 环境设计一个可执行的 Python rule prior program。该程序会与学习得到的 HASAC actor 高斯策略融合；它不是独立控制器，也不能绕开环境物理约束。
+你是一名熟悉强化学习、Soft Actor-Critic（SAC）、车辆纵向控制和燃料电池混合动力汽车（FCHEV）能量管理的工程师。请根据下述项目接口，为 FCHEV 环境设计一个可执行的 Python rule-prior 程序。该程序为两个独立 SAC agent 提供高斯动作分布先验。它不是独立控制器，也不能绕过环境物理约束。
 
 ### 1. 项目背景与优化目标
 
-这是一个燃料电池混合动力电动汽车（FCHEV）驾驶策略项目。SUMO 提供道路、前车、信号灯和车辆运动仿真；Python 环境把车辆纵向动力学与燃料电池系统（FCS）、电池和电驱单元（EDU）模型连接起来；HASAC 使用两个独立 actor：driving actor 负责车辆加速度，energy actor 负责 FCS 请求功率。两个 actor 使用集中式 critic，并在 HASAC 中共同优化同一个团队 reward。
+本项目研究燃料电池混合动力汽车的驾驶与能量管理策略。SUMO 仿真道路、引导车辆、交通信号灯和车辆运动；Python 环境将车辆纵向动力学与燃料电池系统（FCS）、电池和电驱单元（EDU）模型耦合起来。
 
-目标是在完成跟车和交通任务的同时：
+控制器由两个相互独立的随机 SAC agent 组成，各自使用独立的 observation 和 reward：
 
-- 正确跟随引导车，避免追尾，并尽量平顺地加速、减速；
-- 遵守道路和路口限速，理解信号灯并安全通过路口；
-- 减少氢耗、FCS 退化、电池 SOH 损失和 EDU 损耗；
-- 维持电池 SOC 接近目标值 0.5。
+- **Driving agent：** 一级且占主导地位的任务是跟随引导车辆。它使用当前 ego 和 lead 的速度、加速度、车距，以及下文列出的信号灯和限速信息，决定 ego 加速度。只要可行，就应保持不小于 `D_safe` 的安全车距，并尽量避免车距超过规定的最大距离 `D_max`；车距过大时应采取行动缩短距离。车距小于 `D_safe` 属于过近，存在碰撞或车辆重叠风险。跟车始终是驾驶的主要目标，同时不得违反当前道路区域的限速。ego 只能在绿灯时通过信号灯路口，必须在绿灯时越过停止线；红灯和黄灯都禁止越线。
+- **Energy agent：** 选择 FCS 请求输出功率。其目标是降低氢耗、FCS/电池/EDU 退化，并使电池 SOC 接近目标值 0.5。
 
-控制周期为每步 1 s。每个 step 中，两个 actor 都根据该时刻的 observation 各自重新决策；rule program 也使用同一时刻的 observation 评估一次并生成相应 prior。该步的 action 和 prior 只用于当前 step，并在下一个 step 根据新 observation 重新计算。
+两个 agent 分别优化各自对应的 reward。Driving agent 的主要目标是在安全车距和规定的最大车距范围内跟车，同时遵守限速和交通信号；energy agent 负责功率管理、部件健康和 SOC 调节。两者的 reward 不会合并为共享 team reward。
 
-SOC 偏差是能量管理目标，不是电池退化量。现有观测没有直接包含电机转矩、即时 EDU 损耗、FCS 功率请求、电池功率或氢耗；规则不得假设这些量能从 observation 直接读取。如果需要根据它们决策，只能使用明确标注的近似估计，并说明该估计的限制。
+控制周期为每步 1 s。每一步中，两个 agent 都根据该时刻的当前状态分别决策。Energy agent 的 observation 包含当前测得的 ego 加速度和 ego 速度，不包含 driving agent 在本步新选择的加速度。Rule program 每步基于同一份完整原始 observation 调用一次，同时生成两个 prior。两项 action 在同一个环境 step 中执行；下一步根据更新后的状态重新决策。
+
+SOC 偏差属于能量管理目标，不是电池退化指标。当前 observation 不直接包含电机扭矩、瞬时 EDU 损耗、请求 FCS 功率、电池功率或氢耗。不要假设 rule 能直接获得这些量。如果需要估算，必须将其明确标注为近似并说明局限。
 
 ### 2. 当前仿真环境与精确数值
 
 **道路与任务：**
 
-- 路网中有 25 个信号灯路口，相邻路口间距 1000 m。
-- 一个 episode 最长 6000 s；每个 RL step 为 1 s。
-- ego 和引导车均从 0 m/s 起步，初始车距 10 m。引导车目标速度为 13 m/s（46.8 km/h）。
-- 引导车采用 SUMO IDM 跟车模型；其 vType 参数为 accel=0.7 m/s²、decel=1.5 m/s²、emergencyDecel=1.5 m/s²、minGap=3 m、tau=1.5 s、sigma=0、speedDev=0。引导车的常规和紧急最大减速度都与 ego 的动作减速度下限 1.5 m/s² 一致。ego 的 SUMO vType 仍保留 emergencyDecel=6.68 m/s²；ego 的常规动作映射范围为 [-1.5, 0.7] m/s²。引导车在距离信号灯 200 m 内及路口内部受 30 km/h 速度上限约束。
-- 25 个信号灯之间共有 24 段相邻路段，每段给引导车设置一个随机停车点；每次停车 50–100 s，停车点距该段两端至少 100 m。随机场景由 seed 决定，同一 seed 下信号初相位和停车计划可复现。
-- 信号灯周期 90 s：绿灯 40 s、黄灯 3 s、红灯 47 s。各信号灯初始相位不同，因此不会全部同步。
-- 普通道路限速 60 km/h（16.6667 m/s）；启用的路口限速区为 30 km/h（8.3333 m/s），长度为停止线前 100 m，并覆盖路口内部。驶出路口后恢复 60 km/h。
-- Observation 中的限速与信号灯状态分开表示：红灯不会把限速 observation 变成 0。进入 30 km/h 区域后，下一个限速区域是路口后的 60 km/h 区域。
-- 车辆最高速度为 70 km/h（19.4444 m/s）。它是硬上限；当请求加速会使速度超过上限时，环境会截断加速度。
-- 引导车在终点停车；当引导车到达终点停车位置并基本停稳，episode 正常结束。车辆完成路线也会结束 episode。
+- 路线包含 25 个信号灯路口，路口间距 1000 m，相邻路口之间有 24 段道路。每个 episode 最长 6000 s，每个控制 step 为 1 s。
+- Ego 和 lead 均以 0 m/s 起步，初始车距为 10 m。Lead 的速度和加速度随场景变化，并会在路线终点停车。
+- **主要驾驶任务——跟车：** Driving agent 的主要任务是跟随 lead。使用当前 ego、lead 的速度和加速度，以及观测到的车距，在可行时将 ego 维持在安全距离 `D_safe` 和规定最大距离 `D_max` 之间。若车距小于 `D_safe`，应降低接近速度并保护最小安全距离。若红绿灯、限速或其他限制导致车距超过 `D_max`，应将其视为追赶情形：在继续遵守限速和绿灯通行要求的同时，采取可行行动主动缩小车距，使其回到 `D_safe`–`D_max` 范围。受限时仍应向 lead 推进；不要因为车距已经过大就保持停车。
+- **决策频率和预测窗口：** 每个 1 s step 都使用当步 observation 调用一次 rule。每次决策使用有限预测窗口 `H=5–20` steps（5–20 s），预测 ego、lead、信号灯、限速区域和近似功率需求的可能结果。Driving 加速度 prior 和 energy 功率 prior 都要参考这个相同窗口内的预测结果。由于 SUMO 在单步内的运动和积分方式可能与简化预测不同，驾驶预测须加入 1 s 的保守不确定裕量：考虑 ego 实际行驶距离可能比名义预测多一个 step，并在评估跟车间距、越过停止线和进入限速区域时使用这个更早到达的情况。不要预测超过 `H` 的未来；下一 step 根据新 observation 重新计算 prior。
+- **Action 范围和物理能力：** Driving agent 请求加速度范围为 `[-1.5,+0.7] m/s²`（最大请求制动减速度 1.5 m/s²，最大正加速度 0.7 m/s²）。Energy agent 请求 FCS 输出功率范围为 `[0,50] kW`。Ego 另有 70 km/h 的硬性最高速度，环境禁止倒车。电池、EDU 和动力系统可行域还可能进一步限制实际加速度或交付功率。
+- **限速：** 普通道路限速为 60 km/h（16.6667 m/s）。每个停止线前 100 m 起至路口内部，ego 限速为 30 km/h（8.3333 m/s）；驶离路口限速区后恢复 60 km/h。Observation 提供当前限速、下一个限速以及到下一个限速区域入口的距离。红灯不会把限速 observation 改成 0。
+- **交通信号灯：** 每个信号灯周期为 90 s：绿灯 40 s、黄灯 3 s、红灯 47 s。各路口信号相位有不同偏移。Observation 提供下一个信号灯状态、到停止线距离以及当前相位剩余时间。Ego 只能在绿灯时越过停止线；红灯和黄灯都禁止越线。若预测某个候选 action 会在 `H` 内到达停止线，应根据预测车辆运动和越线时的信号相位判断该 action 是否允许。不要在 `H` 之外进行无界的信号预测；下一 step 重新判断。
+- **跟车与道路规则的平衡：** 跟车是首要驾驶目标。根据同一个预测窗口，在跟车的基础上评估限速和信号灯要求。预测结果显示存在冲突时，应在尽量维持跟车的同时遵守道路限速和绿灯越线要求。若这些约束使目标车距暂时无法实现，应先遵守道路和信号规则，并在条件允许后恢复跟车。
+- Lead 到达路线终点并基本静止时 episode 正常结束；Ego 完成路线也会结束 episode。
 
-**车辆与动作边界：**
+**车辆与 action 范围：**
 
-- 车辆质量 7000 kg，长度 8 m，车轮半径 0.4 m，迎风面积 5.8 m²，风阻系数 0.55，滚阻系数 0.0085，旋转质量系数 1.05，空气密度 1.225 kg/m³，重力加速度 9.8 m/s²，道路坡度 0°。
-- actor 的 driving action 经 tanh 后为 u_d ∈ [-1, 1]，再映射成请求加速度：u_d < 0 时 a_req = 1.5 u_d（[-1,0] 对应 [-1.5,0] m/s²）；u_d ≥ 0 时 a_req = 0.7 u_d（[0,1] 对应 [0,0.7] m/s²）。
-- 环境禁止倒车：车辆静止时，负加速度请求会被物理处理截断，不会让车辆向后行驶。
-- ego 的 SUMO speed mode 设为 0，由环境直接设置速度，因此 SUMO 不会替 ego 执行跟车、限速或红灯停车监督；道路限速仍通过 reward/终止条件处理，70 km/h 是单独的车辆硬上限。
-- actor 的 energy action 经 tanh 后为 u_e ∈ [-1,1]，再映射为 FCS 请求功率 P_req = 25(u_e+1) kW，即 [0,50] kW。
-- FCS 最大功率为 50 kW，DC/DC 效率为 0.95。FCS 实际执行功率可能受能量分配、EDU 需求和电池物理限值影响，不保证等于请求值。
-- 电池为 A123 26650 LiFePO₄ 电芯模型，配置为 106 串、134 并；单体标称电压 3.3 V、容量 2.3 Ah。SOC 初值和目标值均为 0.5，SOC 工作范围 [0.15, 0.9]；放电上限 2C、充电上限 1C，单体电压范围 2.0–3.6 V，初始 core/surface/coolant 温度均为 25°C。电池采用二阶 RC 电热模型和数据查表。
-- EDU 使用 EPA Generic IPM 150 kW EDU 数据集的整套 EDU map，包含 motor、inverter、gearbox 的组合边界，不是 motor-only map；传动比为 9.5。数据中未提供额定效率，不要把峰值效率称为额定效率。环境使用总 EDU 效率/损耗 map 和有效工作区，不应再重复添加 inverter 或 gearbox 损耗。
-- FCS 氢耗表来自 Lin and Zheng (2011) 的原始 50 kW FCS 多项式数据，未缩放为其他额定功率；老化模型同时计算启动、低功率、高功率和负载变化引起的退化。EDU 老化参考点为机械功率 75 kW、转矩 156 Nm、转速 4591 rpm，参考寿命 30000 h；电池按当前电热与老化模型更新 SOH。
-- 没有跟车监督器或信号灯监督器替 RL 控车。SUMO 不会替 ego 自动跟车或自动等红灯；但电池/FCS/EDU 可行域、禁止倒车和最高车速硬限制仍然生效。请求动作可能因这些物理约束而与实际执行动作不同。
+- 车辆质量 7000 kg；长度 8 m；车轮半径 0.4 m；迎风面积 5.8 m²；风阻系数 0.55；滚动阻力系数 0.0085；旋转质量系数 1.05；空气密度 1.225 kg/m³；重力加速度 9.8 m/s²；道路坡度 0°。
+- 归一化驾驶 action `u_d ∈ [-1,1]` 映射为请求加速度：若 `u_d < 0`，`a_req = 1.5u_d`（[-1,0] 映射到 [-1.5,0] m/s²）；若 `u_d ≥ 0`，`a_req = 0.7u_d`（[0,1] 映射到 [0,0.7] m/s²）。
+- 环境强制速度不小于零：控制步长为 1 s 时，加速度不会低于 `−v/Δt`，所以车辆静止时负加速度请求会被截为 0 m/s²；车辆行驶时可以减速至静止，但不会倒车。不要在 rule 中额外设置低速阈值，把负加速度请求改为零；不倒车限制由环境处理。
+- Ego 的 SUMO speed mode 为 0，环境直接设置 ego 速度。因此 SUMO 不会监督 ego 跟车、限速或红灯停车。道路限速由 reward/终止逻辑处理；70 km/h 车辆最高速度则是独立硬约束。
+- 归一化能量 action `u_e ∈ [-1,1]` 映射为 FCS 请求功率 `P_req = 25(u_e+1) kW`，即 [0,50] kW。
+- FCS 最大输出为 50 kW，DC/DC 效率为 0.95。实际 FCS 输出可能受能量调度、EDU 需求和电池物理限制影响，不保证等于请求值。
+- 电池模型为 A123 26650 LiFePO₄ 电芯组成的 106 串 134 并电池包。单体标称电压 3.3 V、容量 2.3 Ah。初始和目标 SOC 均为 0.5；SOC 范围 [0.15,0.9]；最大放电和充电倍率分别为 2C、1C；单体电压范围 2.0–3.6 V；初始 core、surface、coolant 温度均为 25°C。电池使用二阶 RC 电热模型和查表数据。
+- EDU 使用 EPA Generic IPM 150 kW EDU 完整 map，物理边界包含电机、逆变器和变速箱，并非单独电机 map。齿轮比 9.5。数据集没有提供额定效率，不要把峰值效率称为额定效率。环境使用完整 EDU 效率/损耗 map 和有效工作区间，不要重复加入逆变器或变速箱损耗。
+- FCS 氢耗表来自 Lin and Zheng (2011) 原始 50 kW FCS 多项式，没有缩放到其他额定功率。退化模型考虑启动、低功率、高功率和负载变化退化。EDU 老化参考点为机械功率 75 kW、扭矩 156 Nm、转速 4591 rpm，参考寿命 30000 h。电池 SOH 由当前电热和老化模型更新。
+- Ego 没有跟车或信号灯监督器。SUMO 不会自动控制 ego 跟随 lead，也不会在红灯时自动让 ego 停车。电池/FCS/EDU 可行域、不倒车规则和最高速度硬限制仍然有效。物理约束可能使实际执行 action 与请求不同。
 
-### 3. Observation、actor 输入与量纲
+### 3. Observation、Agent 输入与量纲
 
-rule program 的输入是**完整、原始、未归一化的 15 维 observation**，顺序不可改变。环境会把没有下一个信号灯时的信号状态编码为绿灯 1、距离 30000 m、剩余时间 0 s；30000 m 是“没有可见目标/超出有效范围”的哨兵值。
+Rule program 接收**完整、原始、未归一化的 15 维 observation**，顺序如下。当没有下一个信号灯时，环境将其状态编码为绿灯（1）、距离 30000 m、相位剩余时间 0 s。30000 m 是“无可见目标/超出有效范围”的哨兵值。信号灯距离 0 m 仍是有效 observation，表示 ego 位于停止线或已到达停止线；不表示没有信号灯。除非接口明确规定，否则不要将 0 或负距离解释为信号灯不存在。下一个信号灯可能在较远处可见；其相位相关性每步根据预计到达时间和当前相位剩余时间评估，与 100 m 限速区域独立。
 
-| 索引 | 名称 | 单位 / 编码 |
+| 索引 | 名称 | 单位/编码 |
 |---:|---|---|
-| 0 | 电池 SOC | fraction，通常 [0.15, 0.9] |
-| 1 | 电池 SOH | fraction，初值 1 |
-| 2 | FCS SOH | fraction，初值 1 |
-| 3 | EDU SOH | fraction，初值 1 |
-| 4 | ego 当前加速度 | m/s² |
-| 5 | ego 当前速度 | m/s |
-| 6 | 引导车当前加速度 | m/s² |
-| 7 | 引导车当前速度 | m/s |
-| 8 | ego 到前车的距离 | m，最大观测值 30000 |
-| 9 | 下一个信号灯状态 | 红灯 0、绿灯 1、黄灯 2 |
+| 0 | 电池 SOC | 比例值，通常 [0.15,0.9] |
+| 1 | 电池 SOH | 比例值，初始值 1 |
+| 2 | FCS SOH | 比例值，初始值 1 |
+| 3 | EDU SOH | 比例值，初始值 1 |
+| 4 | 当前 ego 加速度 | m/s² |
+| 5 | 当前 ego 速度 | m/s |
+| 6 | 当前 lead 加速度 | m/s² |
+| 7 | 当前 lead 速度 | m/s |
+| 8 | Ego 到 lead 车距 | m，观测最大值 30000 |
+| 9 | 下一个信号灯状态 | 红 0、绿 1、黄 2 |
 | 10 | 到下一个信号灯停止线的距离 | m，最大 30000；无信号灯时为 30000 |
-| 11 | 当前信号相位剩余时间 | s，通常 [0, 100]；无信号灯时为 0 |
-| 12 | 当前区域限速 | m/s；主路 16.6667、路口区 8.3333 |
+| 11 | 当前信号相位剩余时间 | s，通常 [0,100]；无信号灯时为 0 |
+| 12 | 当前区域限速 | m/s；主路 16.6667，路口限速区 8.3333 |
 | 13 | 下一个限速区域的限速 | m/s |
 | 14 | 到下一个限速区域入口的距离 | m，最大 30000 |
 
-HASAC 内部 driving actor 接收原始 observation 的索引 4–14 共 11 维；仅将信号灯类别除以 2，其他值仍用上述 SI 单位。Energy actor 接收 5 维：[当前 ego 加速度、SOC、电池 SOH、FCS SOH、EDU SOH]。但 rule program 统一接收完整的原始 15 维 observation，而不是这两个 actor 的拆分输入。
+当前 SAC 实验配置开启 observation normalization。筛选各 agent 输入前，SOH 索引 1–3 变为 `(1−SOH)×1000`；加速度索引 4、6 除以 1.5；速度索引 5、7 除以 20；车距/距离索引 8、10、14 除以 1000；信号灯状态索引 9 除以 2；相位时间索引 11 除以 100；限速索引 12、13 除以 20。Driving agent 接收归一化后的索引 4–14（11 个值）。Energy agent 接收归一化后的索引 [4,5,0,1,2,3]（6 个值）：当前 ego 加速度、ego 速度、SOC、电池 SOH、FCS SOH 和 EDU SOH。在同一个 step 中，两个 agent 的输入都来自 action 执行前的同一个环境 observation；Energy agent 不会收到 Driving agent 本步刚选出的 action。Rule program 始终接收完整的 15 维原始 observation。
 
-### 4. Action 的物理映射与实际执行
+### 4. SAC Action 与物理执行
 
-每个 actor 输出一个标量高斯策略，经 tanh 得到归一化 action：
+每个独立 SAC actor 都表示一个 latent 空间中的一维高斯策略。Actor 预测 mean 和 log standard deviation；`log_std` 截断到 [-20,2]，`std = exp(log_std)`。随机策略采样为 `z = mean + std × ε`，其中 `ε ~ Normal(0,1)`，再计算 `u = tanh(z)`。确定性评估使用 `u = tanh(mean)`。
 
-- driving actor：u_d = tanh(z_d)，然后按上节的分段线性关系映射成请求加速度 [-1.5, 0.7] m/s²；
-- energy actor：u_e = tanh(z_e)，映射成 0–50 kW FCS 请求功率。
+- Driving actor：`u_d ∈ [-1,1]`，再由第 2 节的分段映射转换为 [-1.5,0.7] m/s² 的请求加速度。
+- Energy actor：`u_e ∈ [-1,1]`，再由 `P_req = 25(u_e+1) kW` 转换为 [0,50] kW 的 FCS 输出功率请求。
+- 两个 actor 相互独立，使用不同 observation 和 reward。任何一个 actor 的输入都不含另一个 actor 本步新选出的 action。
+- 环境随后检查车辆动力学和动力系统可行性。最高速度、不倒车、电池功率/SOC/电流/电压限制、EDU 扭矩-转速/效率有效域及 FCS 限制都可能截断或改变请求。Rule prior 不能绕过或修改这些约束。
 
-这两个 action 是两个独立 actor 的输出，不存在固定的一一对应关系。环境随后执行车辆动力学和功率分配可行性检查；最大车速、禁止倒车、电池功率/SOC/电流/电压边界、EDU torque-speed/效率有效区及 FCS 限值都可能截断或改变请求。Rule prior 不能绕过或修改这些限制。
+### 5. 当前 Reward 定义
 
-### 5. 当前 reward 定义
+两个独立 SAC agent 使用不同 reward。下表数值对应 `config/experiments/maddpg_individual_reward_g0999_500ep.json` 这一独立 reward 参考配置，不保证其他实验配置使用相同数值。Driving agent 优化 driving reward，energy agent 优化 energy reward；两者不会收到共享 team reward。
 
-HASAC 的 driving reward 与 energy reward 会相加，作为两个 actor **共同收到的同一个团队 reward**。以下系数来自当前配置：
-
-| 系数 | 当前值 | 主要作用 |
+| 系数 | 当前值 | 主要用途 |
 |---|---:|---|
 | β₀ | 1 | 跟车 |
 | β₁ | 0.2 | 氢耗 |
@@ -89,126 +88,112 @@ HASAC 的 driving reward 与 energy reward 会相加，作为两个 actor **共�
 | β₄ | 100000 | EDU 退化增量 |
 | β₅ | 2 | 驾驶舒适性 |
 | β₆ | 10 | SOC 偏差 |
-| β₇ | 1 | 信号灯预测奖励 |
-| β₈ | 500 | 进入较低限速区的速度 shaping |
+| β₇ | 1 | 红绿灯预测 reward |
+| β₈ | 500 | 进入低限速区域前的速度 shaping |
 
-主要分量如下。rule 可辅助改善这些目标，但不能假定某个单项 reward 与总 reward 等价：
+这些 reward 函数和系数是 RL 的训练信号，用于解释 actor 被鼓励学习的行为。生成的 rule 是参考 prior，不是 reward 函数的代码实现。它不需要复现每一项、每个系数或每步 reward 计算，也不应机械地逐项优化 reward 公式。请用它们理解任务优先级和权衡。Driving prior 应协助车辆在安全且不过大的车距内跟随，同时遵守限速和信号灯；energy prior 应协助管理 FCS 功率，降低氢耗和部件退化，并使 SOC 接近目标。两个 agent 的任务和 reward 要保持区分。
 
-**跟车项。** ego 速度 v 使用 m/s，车距 d 使用 m：
+Driving reward 是 following、comfort、traffic-light、speeding、绿灯越线一次性奖励、限速入口 shaping、静止时负加速度惩罚、达到限速时仍请求正加速度惩罚、terminal penalty 的总和。Energy reward 是 hydrogen、FCS 退化、电池 SOH 损失、EDU 退化和 SOC 各项之和。
 
-- D_safe = 2 + 0.5v + 0.0625v²；D_max = 10 + v + 0.0825v²；d_ref = 200 m。
-- 0 ≤ d < D_safe：c_follow = C₀ − C₁(1 − d/D_safe)³，其中 C₀=5、C₁=500。
-- D_safe ≤ d ≤ D_max：c_follow = C₀。
-- D_max < d < d_ref：c_follow = C₀ − C₂(d−D_max)/(d_ref−D_max)，其中 C₂=5。
-- d ≥ d_ref：c_follow = C₃ × (本 step ego 前进距离 / 当前区域限速 m/s)，其中 C₃=5。前进距离单位为 m，因此比值单位为秒。没有有效前车距离时该项为 0。
-- 最终跟车 reward 为 β₀ c_follow。
+**跟车项。** 使用 action 执行后的 ego 速度 `v_(t+1)`（m/s）和车距 `d_(t+1)`（m）：
 
-**舒适性。** c_comfort = −|a_t−a_(t−1)| / 2.2，单位加速度变化以 m/s² 计；reward 为 β₅ c_comfort。2.2 来自请求加速度范围 0.7−(−1.5)。
+- `D_safe = 2 + 0.5v + 0.0625v²`；`D_max = 10 + v + 0.0825v²`；`d_ref = 200 m`。
+- `0 ≤ d < D_safe` 时：`c_follow = C₀ − C₁(1 − d/D_safe)³`，其中 `C₀=5`、`C₁=500`。
+- `D_safe ≤ d ≤ D_max` 时：`c_follow = C₀`。
+- `D_max < d < d_ref` 时：`c_follow = C₀ − C₂(d−D_max)/(d_ref−D_max)`，其中 `C₂=5`。
+- `d ≥ d_ref` 时：`c_follow = C₃ × (本 step ego 前进距离 / 当前区域限速)`，其中 `C₃=5`。前进距离单位为 m，限速单位为 m/s，因此比值单位为秒。Lead 车距无效时这一项为 0。
+- 最终跟车 reward 为 `β₀ c_follow`。
 
-**能量与退化。** 当前实现按每个 step 的增量惩罚：氢耗项为 −β₁ × 本 step 氢耗(g)；FCS 项为 −β₂ × 100 × FCS 退化增量；电池项为 −β₃ × 100 × 电池 SOH 损失增量；EDU 项为 −β₄ × 100 × EDU CLR 增量。100 把 fraction 增量换成百分数点。SOC 项为 −β₆ × |SOC−0.5|。
+**舒适性。** `c_comfort = −|a_exec,t−a_exec,t−1| / 2.2`，使用实际执行加速度（m/s²）。Reward contribution 为 `β₅ c_comfort`。除数 2.2 来自请求加速度范围 `0.7−(−1.5)`。
 
-**信号灯。** 根据当前速度估算到停止线的时间 t₁ = 距离/速度。仅在速度大于 0 且 t₁ 小于当前相位剩余时间 t₂ 时计分：当前相位为绿灯，raw reward 为 +C_green；当前相位为黄灯或红灯，raw reward 为 −C_non-green。当前 C_green=C_non-green=5，乘 β₇=1。绿灯越过停止线另有一次性 +50 bonus。闯红灯仍会结束 episode；黄灯本身不会触发该红灯终止条件。
+**能耗与退化。** 实现按每步增量惩罚：氢耗项 = `−β₁ × 本 step 氢耗（g）`；FCS 项 = `−β₂ × 100 × FCS 退化增量`；电池项 = `−β₃ × 100 × 电池 SOH 损失增量`；EDU 项 = `−β₄ × 100 × EDU CLR 增量`。系数 100 用于将比例增量转为百分点。SOC 项为 `−β₆ × |SOC−0.5|`。
 
-**限速。** 当前限速为 30 或 60 km/h，连续超速项为 −100 × max(v−v_limit,0)/v_limit。车辆 70 km/h 硬上限独立于 posted limit。进入较低限速区时，使用减速度估计值 0.75 m/s² 预测入口速度：v_entry = sqrt(max(0, v²−2×0.75×d_entry))，e = max(0,(v_entry−v_next_limit)/v_next_limit)，entry shaping 为 β₈×(e_t−e_(t+1))，β₈=500。它只针对接近较低限速区，不把红灯当作零限速；代码会在限速区上下文切换或碰撞终止步抑制不合理的正向边界 bonus。
+**红绿灯。** 每一步都根据 action 前的车速、信号灯距离、当前相位和相位剩余时间计算 reward；计算不局限于停止线前 100 m 的限速区。估算到停止线时间 `t₁ = 距离/当前速度`，并与当前相位剩余时间 `t₂` 比较。仅当车速 > 0 且 `t₁ < t₂` 时激活 reward。当前相位为绿灯时 raw reward 为 `+C_green`；为黄灯或红灯时为 `−C_non-green`。当前 `C_green=C_non-green=5`，再乘 `β₇=1`。若 `t₁ ≥ t₂`，当步不激活红绿灯 reward，在下一 step 重新计算。绿灯越过停止线另有一次性 +50 奖励。红灯越线会终止 episode；黄灯越线目前不会触发该终止条件。该 reward 使用当前观测相位；rule 决策还应根据给定有限预测窗口判断越线时的相位。
 
-当前零速负加速度额外惩罚、达到限速后继续请求正加速度的额外惩罚以及异常终止额外惩罚均为 0。
+**限速。** 当前道路限速为 30 或 60 km/h。连续超速项使用 action 执行后的速度：`−100 × max(v_(t+1)−v_limit,0)/v_limit`。车辆 70 km/h 硬性最高速度与道路限速分开。进入较低限速区域前，环境使用 0.75 m/s² 的假设制动减速度预测入区速度：`v_entry = sqrt(max(0, v²−2×0.75×d_entry))`；`e = max(0,(v_entry−v_next_limit)/v_next_limit)`。入口 shaping 为 `β₈×(e_t−e_(t+1))`，其中 `β₈=500`。该项只在接近更低限速区域时计算；红灯不视为 0 限速。限速区域上下文切换或碰撞终止 step 会抑制可能产生的虚假正向边界奖励。
+
+静止时负加速度的额外惩罚、达到限速后仍请求正加速度的额外惩罚，以及所有异常终止的额外 penalty 当前均为 0。
 
 ### 6. Episode 终止条件
 
-- 碰撞（SUMO 报告碰撞）或前车间距 ≤ 0（车辆重叠）会提前终止；当前额外 terminal penalty 为 0。
-- ego 越过停止线时，如果越线前信号灯为红灯，会提前终止；当前额外 penalty 为 0。黄灯越线不由这一条件终止。
-- 当 ego 速度达到或超过当前有效限速的 120% 时提前终止；当前额外 penalty 为 0。30 km/h 区域阈值为 36 km/h；普通 60 km/h 道路阈值为 72 km/h，但车辆 70 km/h 硬上限使普通道路上无法达到该终止阈值。低于终止阈值时，连续超速 reward 仍然生效。
-- 引导车到达终点停车点并停稳或 ego 路线完成时，episode 正常结束。
-- 6000 s 时间上限会 truncation。
-- 车距 300 m 的诊断阈值与 1000 m 的监测阈值只用于记录，不会触发终止；没有“长时间不动”的终止条件。
-- 碰撞、信号灯或超速导致的提前终止目前不额外施加负的 terminal reward；主要效果是 episode 结束。
-- 当前 HASAC 配置的折扣因子 gamma=0.99；训练期间采用随机 warm-up 与高斯策略采样，Rule prior 只参与 actor 策略阶段。
-- 环境区分 terminated 与 time-limit truncated；当前训练代码把 terminated 或 truncated 都作为 replay 中的 done 标志。
+- SUMO 报告碰撞或前向车距 ≤ 0（车辆重叠）时，episode 提前终止；当前没有额外 terminal penalty。
+- Ego 越过停止线的瞬间若信号灯为红灯，仿真提前终止；黄灯越线不触发该终止条件，当前也没有额外 penalty。
+- Ego 速度达到或超过当前道路限速的 120% 时，episode 提前终止；当前没有额外 penalty。30 km/h 限速区的阈值为 36 km/h，普通 60 km/h 道路的阈值为 72 km/h。70 km/h 车辆硬限速使普通道路上的 72 km/h 终止阈值无法达到。达到终止阈值前仍使用连续超速 reward。
+- Lead 到达路线终点停车并静止，或 ego 完成路线时，episode 正常结束。
+- 6000 s 时间上限会产生 truncation。
+- 300 m 跟车距离诊断阈值和 1000 m 监控阈值只用于日志，不终止 episode。没有长时间静止终止条件。
+- 碰撞、闯红灯和超速终止目前没有额外负的 terminal reward；主要影响是 episode 结束。
 
-### 7. Rule prior 与 HASAC actor 的融合
+### 7. SAC 高斯 Rule Prior 与融合
 
-rule program 不直接给出物理加速度或 kW，而是对每个 actor 输出其 tanh 之前的 latent Gaussian 分布参数：mean μ_prior 和标准差 σ_prior。HASAC 的 actor 网络分别预测 mean 和 log_std，log_std 截断在 [-20, 2]，再令 σ_actor=exp(log_std)。两个参数独立融合：
+Rule program 为每个 actor 输出其 `tanh` 前 latent 空间中的分布 prior，不返回物理加速度、kW 或采样后的 action。对 agent `i`（driving 或 energy），SAC actor 预测 `μ_actor^i` 和 `σ_actor^i = exp(log_std_actor^i)`。Rule 输出 `μ_prior^i` 和非负的 `σ_prior^i`。集成 wrapper 独立融合 mean 和 standard deviation：
 
-- μ_f = (1−λ₀) μ_actor + λ₀ μ_prior
-- σ_f = (1−λ₁) σ_actor + λ₁ σ_prior
+`μ_f^i = (1−λ_μ^i) μ_actor^i + λ_μ^i μ_prior^i`
 
-当前 λ₀=0.5、λ₁=0.5。融合后训练时采样 z=μ_f+σ_f ε，ε~Normal(0,1)；确定性评估使用 z=μ_f。接着 u=tanh(z)，最后按第 4 节映射到物理 action。由此 rule 通过改变 actor 的 mean/std 影响动作，而不是覆盖 actor action。σ_prior=0 表示规则建议低不确定性，并不意味着融合后或采样后的最终 action 必然确定；只要 λ₁<1，actor 的标准差仍会保留一部分。
+`σ_f^i = (1−λ_σ^i) σ_actor^i + λ_σ^i σ_prior^i`
 
-训练开始的前 1000 个环境 step 是 replay warm-up，动作由均匀随机采样产生，此阶段不会调用 actor 或融合 prior。之后的 actor 采样和 HASAC 更新才使用 prior。
+Mean 与标准差的融合权重由外部配置提供，二者彼此独立，也与 rule program 无关；Driving 和 Energy 还可以分别配置。只有在没有其他指定时，才可将 0.5 作为示意默认值；不要将融合权重硬编码在 rule 里。对某个 agent/state，`active=False` 表示绕过该 prior，不做融合。若 `σ_prior=0` 且 `λ_σ<1`，由于 SAC actor 仍贡献一部分标准差，融合后的策略依然是随机策略。
 
-### 8. Rule program 的输入/输出接口
+SAC 随机选取 action 时，从融合分布采样 `z = μ_f + σ_f ε`，其中 `ε ~ Normal(0,1)`；之后执行 `u=tanh(z)` 并使用第 4 节中的物理 action 映射。确定性 action 使用 `u=tanh(μ_f)`。Rule 改变 actor 的分布，但不直接覆盖采样或映射后的 action。每个 1 s 决策 step 都根据当步 observation 计算 rule。
 
-生成的模块由外部配置 `llm_prior.program_name` 选择，对应文件路径为 `llm-prior/programs/<program_name>.py`；命令行也可用 `--prior-program-name <program_name>` 覆盖。prior 必须同时在配置中启用。程序必须实现：
+### 8. Rule Program 输入/输出接口
 
-    def predict(observation):
-        ...
+设计一个暴露 `predict(observation)` 的 Python 模块。程序接收完整原始 observation，形式为 NumPy 数组 `(15,)` 或 `(batch,15)`，而不是 SAC actor 的分离后归一化输入。将输入转换为 `float32`，检查形状和有限值，支持单条及 batch 输入，并确定性地返回两个 agent 的 prior。每行每个 agent 输出一个标量，建议使用 `(batch,1)`：
 
-`observation` 是 NumPy 数组，形状为单条状态 `(15,)` 或批量状态 `(batch, 15)`，数值是第 3 节所示完整原始 observation。推荐程序将输入转换为 float32，内部统一转成 batch，再输出 `(batch,1)` 的数组。输出必须是下面的 mapping，并同时包含 driving 与 energy：
+```python
+{
+    "driving": {"mean": driving_prior_mean, "std": driving_prior_std, "active": driving_active},
+    "energy":  {"mean": energy_prior_mean,  "std": energy_prior_std,  "active": energy_active},
+}
+```
 
-    {
-        "driving": {"mean": ..., "std": ..., "active": ...},
-        "energy":  {"mean": ..., "std": ..., "active": ...},
+- 每个 actor 的 action 维度为 1。`mean` 必须为有限值，单位是 `tanh` 前的 latent Gaussian 空间。`std` 必须为有限的非负标准差，不是 `log_std` 或方差。
+- `active` 是可选布尔值或 batch 布尔 mask；省略时默认 `True`。若 rule 对某个 agent/state 没有合理建议，可以设置 `active=False`。Rule program 仍须每个环境 step 调用一次。
+- 一个 program 可为 driving、energy 或二者提供 prior。不得让某个 agent 的决策依赖其 observation 中不可见的另一个 agent 当前 action。
+- 同一 observation 必须确定性地返回相同分布参数。不要在 `predict` 内采样 action 或添加探索噪声。
+- 可以使用 NumPy。不要调用网络服务、API key、在线 LLM、文件 IO、环境全局变量或 SAC 内部对象。Program 只返回 prior 参数；融合、SAC 采样和物理 action 映射按上文定义执行。
+- 新增的阈值或系数必须使用清晰命名的 rule 超参数并解释。不得暗中修改仿真环境、reward、动力系统参数或硬约束。明确列出不可直接观测的物理信号；不要编造数据。
+
+### 9. 最小接口示例：超过当前限速时建议制动
+
+此示例用于说明 prior 接口和 latent mean 定义；它不是完整驾驶策略，也不处理跟车、红绿灯或能量管理。目标归一化 action 为 `−0.999`，对应 prior mean `atanh(−0.999)≈−3.8002`，prior 标准差为 0.05。当 ego 速度没有超过当前限速时，驾驶 prior 不激活。Energy prior 始终不激活。
+
+```python
+import numpy as np
+
+TARGET_U = -0.999
+TARGET_MEAN = float(np.arctanh(TARGET_U))
+
+def predict(observation):
+    x = np.asarray(observation, dtype=np.float32)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if x.ndim != 2 or x.shape[1] != 15:
+        raise ValueError("observation must have shape (15,) or (batch, 15)")
+    if not np.all(np.isfinite(x)):
+        raise ValueError("observation must contain only finite values")
+
+    batch = x.shape[0]
+    speed = x[:, 5]
+    current_limit = x[:, 12]
+    active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
+    drive_mean = np.zeros((batch, 1), dtype=np.float32)
+    drive_mean[active_drive, 0] = TARGET_MEAN
+    drive_std = np.full((batch, 1), 0.05, dtype=np.float32)
+    zeros = np.zeros((batch, 1), dtype=np.float32)
+    inactive = np.zeros((batch, 1), dtype=bool)
+    return {
+        "driving": {
+            "mean": drive_mean,
+            "std": drive_std,
+            "active": active_drive.reshape(batch, 1),
+        },
+        "energy": {"mean": zeros.copy(), "std": zeros.copy(), "active": inactive},
     }
+```
 
-- 两个 actor 的 action 维度均为 1，因此每个 mean/std 对应一个有限标量，推荐数组形状为 `(batch, 1)`。
-- mean/std 必须是在 tanh 前的 latent Gaussian 空间；std 必须有限且 ≥0。
-- active 是可选布尔 mask，形状推荐 `(batch,1)`；若不提供则默认为 True。active=False 表示该状态下完全不融合该 actor 的 prior。
-- 同一个程序可以只影响 driving、只影响 energy，也可以同时影响两者。未打算控制的 actor 应设 active=False。
-- 程序应支持单条和 batch 输入，拒绝错误维度、NaN、Inf；对相同输入应确定性返回相同分布参数。不要在 predict 中抽样动作。
-- 可以使用 NumPy；不要依赖网络服务、API key、LLM 在线调用、文件读写、环境全局变量或 HASAC 内部代码。程序只生成分布参数，由现有 HASAC 完成融合、采样和物理映射。
-- 规则里新增的阈值/系数必须作为清晰命名的超参数并解释依据；不要悄悄改动仿真环境、reward、动力系统参数或硬约束。不可获得的物理信号要明确说明，不得编造。
+例如，若 `observation[5]=18 m/s` 且 `observation[12]=16.6667 m/s`，Driving prior 激活并给出约 −3.8002 的 latent mean；Energy prior 不激活。最终随机 action 仍取决于外部融合权重和 SAC actor 分布。
 
-### 9. 简单接口示例：超过当前限速时建议减速
+### 10. 输出要求
 
-下面是一个最小示例，用于展示接口和 latent mean 的定义；它不是完整驾驶策略，也不处理跟车、信号灯或能量管理。目标归一化动作设为 −0.999，其 pre-tanh mean 为 atanh(−0.999)≈−3.8002。当前速度不超限时，prior inactive；超限时只激活 driving prior。energy prior 始终 inactive。
-
-    import numpy as np
-
-    TARGET_U = -0.999
-    TARGET_MEAN = float(np.arctanh(TARGET_U))
-
-    def predict(observation):
-        x = np.asarray(observation, dtype=np.float32)
-        if x.ndim == 1:
-            x = x.reshape(1, -1)
-        if x.ndim != 2 or x.shape[1] != 15:
-            raise ValueError("observation must have shape (15,) or (batch, 15)")
-        if not np.all(np.isfinite(x)):
-            raise ValueError("observation must contain only finite values")
-
-        batch = x.shape[0]
-        speed = x[:, 5]
-        current_limit = x[:, 12]
-        active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
-        drive_mean = np.zeros((batch, 1), dtype=np.float32)
-        drive_mean[active_drive, 0] = TARGET_MEAN
-        zeros = np.zeros((batch, 1), dtype=np.float32)
-        inactive = np.zeros((batch, 1), dtype=bool)
-        return {
-            "driving": {
-                "mean": drive_mean,
-                "std": zeros.copy(),
-                "active": active_drive.reshape(batch, 1),
-            },
-            "energy": {
-                "mean": zeros.copy(),
-                "std": zeros.copy(),
-                "active": inactive,
-            },
-        }
-
-例如，若 observation[5]=18 m/s、observation[12]=16.6667 m/s，则 driving prior 的 mean≈−3.8002、std=0、active=True。以 λ₀=0.5 为例，融合后 mean 是 actor mean 与 −3.8002 的平均值；之后仍会执行高斯采样（训练时）、tanh 和物理 action 映射。环境仍可能根据最高速度、禁倒车和动力系统可行域截断结果。
-
-### 10. 你的输出要求
-
-请只输出下面两部分，内容完整到可以审查并直接集成：
-
-**A. 可执行 Python program**
-
-提供完整源代码，建议文件名 `<program_name>.py`，放入 `llm-prior/programs/` 后可由现有 HASAC loader 导入。必须实现上面的 `predict(observation)` 接口；若使用参数化 rule，也可提供 `build_prior(config)`，但 `predict` 能力必须存在。代码应包括输入形状/有限值检查、单条与 batch 处理、两个 agent 的输出，以及必要的注释。不要输出伪代码、省略号或依赖未提供文件的片段。
-
-**B. Rule 效果说明**
-
-说明 rule 的目标、使用了哪些 observation 索引、每条规则的触发条件与优先级、两个 actor 的 mean/std/active 如何设置、λ 融合后如何影响动作、边界和缺失目标如何处理、用了哪些新增超参数以及理由。给出至少一个 15 维 observation 的测试例子和对应输出摘要，并说明如何把程序名填入 `llm_prior.program_name`、如何做接口 smoke test。诚实说明 rule 能改善什么、不能保证什么，尤其不能保证未观测的电机损耗最优或覆盖 HASAC 学到的策略。
-
-不得宣称示例程序已经在 SUMO 中训练或验证。不得修改环境参数，不得给 observation 增加字段，不得返回物理 action，也不得让程序绕过 episode 终止条件或车辆/电池/EDU 物理约束。
+请输出：(A) 完整 Python 模块及建议文件名；(B) 对 rule 逻辑、使用的 observation、触发条件、`active` mask、mean/std 数值范围和边界的准确简要说明。说明高斯 prior 如何经过外部融合和 `tanh` 影响 SAC actor，并区分 prior 与最终执行 action。明确列出假设、不可用的信号和新增的 rule 超参数。不要提供测试套件，不要要求执行代码，也不要声称代码已在 SUMO 中运行或验证。

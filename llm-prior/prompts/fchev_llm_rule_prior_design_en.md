@@ -1,17 +1,17 @@
-You are an engineer experienced in reinforcement learning, SAC/HASAC, longitudinal vehicle control, and fuel-cell hybrid electric vehicles (FCHEVs). Based on the project interface below, design an executable Python rule-prior program for the FCHEV environment. The program will be fused with a learned HASAC actor's Gaussian policy. It is not a standalone controller and must not bypass the environment's physical constraints.
+You are an engineer experienced in reinforcement learning, Soft Actor-Critic (SAC), longitudinal vehicle control, and fuel-cell hybrid electric vehicles (FCHEVs). Design an executable Python rule-prior program for the FCHEV setting below. The program proposes Gaussian action-distribution priors for two independent SAC agents. It is not a standalone controller and must not bypass the environment's physical constraints.
 
 ### 1. Project Background and Objectives
 
-This project studies driving strategies for a fuel-cell hybrid electric vehicle. SUMO provides the road, lead vehicle, traffic lights, and vehicle-motion simulation. A Python environment connects vehicle longitudinal dynamics with fuel-cell system (FCS), battery, and electric-drive-unit (EDU) models. HASAC has two independent actors: the driving actor controls vehicle acceleration, and the energy actor requests FCS output power. The actors use a centralized critic and jointly optimize the same team reward in HASAC.
+This project develops driving and energy-management strategies for a fuel-cell hybrid electric vehicle (FCHEV). SUMO simulates the road, lead vehicle, traffic lights, and vehicle motion. The Python environment couples vehicle longitudinal dynamics with the fuel-cell system (FCS), battery, and electric-drive-unit (EDU) models.
 
-The objectives are to complete the driving task while:
+The controller has two independent stochastic SAC agents with separate observations and rewards:
 
-- Following the lead vehicle correctly, avoiding rear-end collisions, and accelerating/decelerating smoothly;
-- Respecting road and intersection speed limits, responding to traffic lights, and crossing intersections safely;
-- Reducing hydrogen consumption, FCS degradation, battery SOH loss, and EDU losses;
-- Keeping battery SOC close to its target of 0.5.
+- **Driving agent:** Its level-one, dominant task is to follow the lead vehicle. It uses the live ego and lead speeds and accelerations, their distance, and the traffic-light and speed-limit observations described below to choose ego acceleration. It should maintain a safe following gap of at least `D_safe` and, whenever feasible, avoid allowing the gap to exceed the prescribed maximum `D_max`; if the gap is too large, it should act to close it. A gap below `D_safe` is too close and risks collision or overlap. Following remains the primary driving objective, and it must be carried out without violating the current road-region speed limit. The ego vehicle may pass through a signalized intersection only on green: it must cross the stop line only while the signal is green. Red and yellow both prohibit crossing the stop line.
+- **Energy agent:** It selects the requested FCS output power. Its objective is to reduce hydrogen consumption and degradation of the FCS, battery, and EDU, while keeping battery SOC close to the target value of 0.5.
 
-The control loop runs at 1 s per step. At every step, each actor makes a new decision using that step's current observation, and the rule program is evaluated once on the same observation to produce its prior(s). Each decision applies to the current step and is recomputed from the newly observed state at the next step.
+Each agent optimizes its corresponding reward independently. The driving agent's dominant objective is following within the safe and prescribed distance range, while obeying speed limits and traffic signals; the energy agent is responsible for power management, component health, and SOC regulation. Their rewards are not combined into a shared team reward.
+
+The control loop runs at 1 s per step. At every step, both agents make a new decision from that step's current state. The energy agent's observation contains the currently measured ego acceleration and ego speed; it does not contain the driving agent's newly requested acceleration for the same step. The rule program is evaluated once on the complete raw observation to produce both priors. The decisions are applied in the same environment step and recomputed from the newly observed state at the next step.
 
 SOC deviation is an energy-management objective, not a battery degradation metric. The current observation does not directly include motor torque, instantaneous EDU loss, requested FCS power, battery power, or hydrogen consumption. Do not assume these quantities are directly available to the rule. If a rule needs to estimate them, clearly label the estimate as an approximation and explain its limitations.
 
@@ -19,33 +19,32 @@ SOC deviation is an energy-management objective, not a battery degradation metri
 
 **Road and task:**
 
-- The route has 25 signalized intersections, spaced 1000 m apart.
-- An episode is limited to 6000 s; each RL step is 1 s.
-- Both the ego vehicle and lead vehicle start at 0 m/s, with an initial gap of 10 m. The lead vehicle's target speed is 13 m/s (46.8 km/h).
-- The lead vehicle uses SUMO's IDM car-following model. Its vType parameters are accel=0.7 m/s², decel=1.5 m/s², emergencyDecel=1.5 m/s², minGap=3 m, tau=1.5 s, sigma=0, and speedDev=0. Both lead braking limits match the ego action's maximum requested deceleration of 1.5 m/s². The ego SUMO vType still retains emergencyDecel=6.68 m/s²; its normal action mapping range is [-1.5, 0.7] m/s². The lead is speed-limited to 30 km/h within 200 m of a signal and inside the intersection.
-- There are 24 road segments between adjacent signalized intersections. One random stop is assigned to the lead vehicle on each segment; each stop lasts 50–100 s, and the stop point is at least 100 m from either end of that segment. The random scenario is determined by the seed, so signal initial phases and the stop plan are reproducible for a fixed seed.
-- Each traffic light has a 90 s cycle: 40 s green, 3 s yellow, and 47 s red. Initial phases differ across lights, so they are not synchronized.
-- The ordinary-road speed limit is 60 km/h (16.6667 m/s). The enabled intersection speed zone is 30 km/h (8.3333 m/s), covering the 100 m approach before the stop line and the interior of the intersection. The limit returns to 60 km/h after leaving the intersection.
-- Speed-limit and traffic-light information are represented separately in the observation: a red light does not turn the speed-limit observation into zero. Once inside the 30 km/h zone, the next speed region is the 60 km/h road after the intersection.
-- The vehicle's maximum speed is 70 km/h (19.4444 m/s). This is a hard cap: the environment clips acceleration if the requested acceleration would take the vehicle above it.
-- The lead vehicle stops at the route's terminal stop. An episode ends normally when the lead vehicle reaches that stop and is nearly stationary; completion of the ego route also ends the episode.
+- The route has 25 signalized intersections spaced 1000 m apart, with 24 road segments between adjacent intersections. An episode is limited to 6000 s, and each control step is 1 s.
+- Both ego and lead vehicles start at 0 m/s with an initial gap of 10 m. The lead vehicle's speed and acceleration vary with the scenario and it stops at the route's terminal stop.
+- **Primary driving task — following:** The driving agent's main task is to follow the lead vehicle. Use the current ego and lead speeds and accelerations and the observed gap to keep the ego between the safe following distance `D_safe` and the prescribed maximum distance `D_max` whenever feasible. If the gap is below `D_safe`, reduce closing speed and protect the minimum safe gap. If traffic lights, speed limits, or other constraints cause the gap to exceed `D_max`, treat the situation as catch-up: choose feasible actions that actively reduce the gap toward the `D_safe`–`D_max` range, while continuing to obey speed limits and the green-only crossing requirement. Keep making progress toward the lead when constrained from closing the gap; do not treat an already excessive gap as a reason to remain stopped.
+- **Decision frequency and prediction horizon:** Evaluate the rule once at every 1 s step using that step's current observation. For each decision, use a finite horizon `H` of 5–20 steps (5–20 s) to predict likely ego, lead, traffic-signal, speed-limit, and approximate power-demand outcomes. Choose both the driving acceleration prior and energy power prior with reference to the predicted outcomes over this same horizon. Because SUMO's exact within-step motion and integration may differ from a simplified predictor, include a conservative uncertainty margin of one simulation step (1 s) in driving predictions: account for the ego traveling up to one step farther than nominally predicted, and use this earlier-arrival case when assessing following gaps, stop-line crossings, and speed-region entries. Do not extrapolate beyond `H`; recompute the priors from the new observation at the next step.
+- **Action ranges and physical capability:** The driving agent requests acceleration in `[-1.5, +0.7] m/s²` (maximum requested braking magnitude 1.5 m/s² and maximum positive acceleration 0.7 m/s²). The energy agent requests FCS output power in `[0, 50] kW`. Ego speed has a separate hard cap of 70 km/h, and the environment prevents reverse motion. Battery, EDU, and powertrain feasibility limits may further restrict actual acceleration or delivered power.
+- **Speed limits:** The ordinary-road posted limit is 60 km/h (16.6667 m/s). The ego's posted limit is 30 km/h (8.3333 m/s) beginning 100 m before each stop line, continuing through the intersection, and returning to 60 km/h after it leaves the intersection zone. The observation provides the current limit, next limit, and distance to the next speed-region entrance. A traffic-light red state does not change the speed-limit observation to zero.
+- **Traffic signals:** Each signal has a 90 s cycle: 40 s green, 3 s yellow, and 47 s red. Signal phases are offset across intersections. The observation provides the next signal's state, distance to its stop line, and remaining time in its current phase. The ego may cross the stop line only when the signal is green; red and yellow prohibit crossing. For any candidate action predicted to reach the stop line within `H`, use the predicted vehicle motion and signal phase at the crossing time to decide whether that action is allowed. Do not make unbounded future signal predictions beyond `H`; reassess on the next step.
+- **Balancing following with road rules:** Following is the primary driving objective. Evaluate speed-limit and signal requirements after following, using the same prediction horizon. When predicted outcomes show a conflict, choose the action that preserves following as much as feasible while respecting the posted speed limit and green-only crossing requirement. If maintaining the desired gap is not feasible under those constraints, obey the road and signal rules and resume following when feasible.
+- The episode normally ends when the lead reaches its terminal stop and is nearly stationary; completion of the ego route also ends the episode.
 
 **Vehicle and action bounds:**
 
 - Vehicle mass: 7000 kg; length: 8 m; wheel radius: 0.4 m; frontal area: 5.8 m²; drag coefficient: 0.55; rolling-resistance coefficient: 0.0085; rotational-mass coefficient: 1.05; air density: 1.225 kg/m³; gravity: 9.8 m/s²; road slope: 0°.
-- After tanh, the driving action is u_d ∈ [-1, 1]. It maps to requested acceleration as follows: if u_d < 0, a_req = 1.5 u_d ([-1,0] maps to [-1.5,0] m/s²); if u_d ≥ 0, a_req = 0.7 u_d ([0,1] maps to [0,0.7] m/s²).
-- Reverse motion is prohibited. A negative acceleration request while stopped is physically clipped and cannot make the vehicle move backward.
+- A normalized driving action `u_d ∈ [-1, 1]` maps to requested acceleration as follows: if `u_d < 0`, `a_req = 1.5 u_d` ([-1,0] maps to [-1.5,0] m/s²); if `u_d ≥ 0`, `a_req = 0.7 u_d` ([0,1] maps to [0,0.7] m/s²).
+- The environment enforces nonnegative speed: with a 1 s step it clips acceleration no lower than `−v/Δt`, so a negative request at standstill becomes 0 m/s² and a moving vehicle can decelerate to rest without reversing. Do not add a rule-level low-speed threshold that changes a negative acceleration request to zero; let the environment handle the no-reverse constraint.
 - The ego vehicle's SUMO speed mode is set to 0, and the environment directly sets its speed. SUMO therefore does not supervise ego following, speed-limit compliance, or red-light stopping. Road limits are handled through rewards/termination logic; the separate 70 km/h vehicle cap is a hard constraint.
-- After tanh, the energy action is u_e ∈ [-1, 1], mapped to requested FCS power as P_req = 25(u_e+1) kW, i.e. [0,50] kW.
+- A normalized energy action `u_e ∈ [-1, 1]` maps to requested FCS power as `P_req = 25(u_e+1) kW`, i.e. [0,50] kW.
 - Maximum FCS output is 50 kW; DC/DC efficiency is 0.95. Actual FCS power may be limited by energy dispatch, EDU demand, and battery physical limits, so it is not guaranteed to equal the request.
 - The battery model represents A123 26650 LiFePO₄ cells in a 106-series, 134-parallel pack. Nominal cell voltage is 3.3 V and capacity is 2.3 Ah. Initial and target SOC are both 0.5; SOC bounds are [0.15, 0.9]; maximum discharge and charge rates are 2C and 1C; cell-voltage range is 2.0–3.6 V; initial core, surface, and coolant temperatures are all 25°C. The battery uses a second-order RC electrothermal model and lookup data.
 - The EDU uses the complete EPA Generic IPM 150 kW EDU map, which represents the combined motor, inverter, and gearbox boundary; it is not a motor-only map. Gear ratio is 9.5. The dataset does not provide rated efficiency; do not label peak efficiency as rated efficiency. The environment uses the total EDU efficiency/loss map and valid operating region, so do not add inverter or gearbox losses a second time.
 - The FCS hydrogen-consumption table comes from the original 50 kW FCS polynomial in Lin and Zheng (2011), without scaling to another rated power. The aging model accounts for startup, low-power, high-power, and load-change degradation. EDU aging uses a reference point of 75 kW mechanical power, 156 Nm torque, and 4591 rpm, with a reference lifetime of 30000 h. Battery SOH is updated by the current electrothermal and aging model.
 - There is no following or traffic-light supervisor controlling the ego vehicle. SUMO does not automatically follow the lead or stop the ego at red lights. Battery/FCS/EDU feasibility limits, the no-reverse rule, and the hard maximum-speed limit remain active. Physical constraints may make the executed action differ from the requested action.
 
-### 3. Observation, Actor Inputs, and Units
+### 3. Observation, Agent Inputs, and Units
 
-The rule program receives the **complete, raw, unnormalized 15-dimensional observation** in the exact order below. When no next traffic light is available, the environment encodes its state as green (1), distance as 30000 m, and remaining phase time as 0 s. The value 30000 m is a sentinel for “no visible target/outside the effective range.”
+The rule program receives the **complete, raw, unnormalized 15-dimensional observation** in the exact order below. When no next traffic light is available, the environment encodes its state as green (1), distance as 30000 m, and remaining phase time as 0 s. The value 30000 m is a sentinel for “no visible target/outside the effective range.” A traffic-light distance of 0 m is still a valid observation: it means the ego is at the stop line or has reached it; it does not mean that no traffic light is present. Do not infer signal absence from a zero or negative distance unless the interface explicitly defines that value as invalid. The next traffic light may be visible far ahead; its phase relevance is evaluated each step from estimated arrival time versus remaining phase time, independently of the 100 m posted-speed zone.
 
 | Index | Name | Unit / encoding |
 |---:|---|---|
@@ -65,20 +64,20 @@ The rule program receives the **complete, raw, unnormalized 15-dimensional obser
 | 13 | Speed limit in the next speed region | m/s |
 | 14 | Distance to the entrance of the next speed region | m, maximum 30000 |
 
-Inside HASAC, the driving actor receives indices 4–14 (11 dimensions); only the signal-state category is divided by 2, while all other values remain in the units above. The energy actor receives 5 values: [current ego acceleration, SOC, battery SOH, FCS SOH, EDU SOH]. The rule program, however, always receives the complete raw 15-dimensional observation, not either actor's split input.
+In the current SAC experiment configuration, observation normalization is enabled. Before each actor's input is selected, SOH indices 1–3 become `(1−SOH)×1000`; acceleration indices 4 and 6 are divided by 1.5; speed indices 5 and 7 by 20; gap and distance indices 8, 10, and 14 by 1000; signal state index 9 by 2; phase time index 11 by 100; and speed-limit indices 12 and 13 by 20. The driving agent receives normalized indices 4–14 (11 values). The energy agent receives normalized indices [4,5,0,1,2,3] (6 values): current ego acceleration, ego speed, SOC, battery SOH, FCS SOH, and EDU SOH. At a given step both agent inputs come from the same pre-action environment observation; the energy agent does not receive the driving agent's newly selected action. The rule program always receives the complete raw, unnormalized 15-dimensional observation.
 
-### 4. Physical Action Mapping and Execution
+### 4. SAC Actions and Physical Execution
 
-Each actor outputs one scalar Gaussian policy, which is passed through tanh to produce a normalized action:
+Each independent SAC actor represents a one-dimensional Gaussian policy in latent space. The actor predicts a mean and log standard deviation; `log_std` is clamped to [-20, 2], and `std = exp(log_std)`. During stochastic policy sampling, `z = mean + std × ε`, where `ε ~ Normal(0,1)`, followed by `u = tanh(z)`. Deterministic evaluation uses `u = tanh(mean)`.
 
-- Driving actor: u_d = tanh(z_d), then mapped to requested acceleration [-1.5, 0.7] m/s² using the piecewise-linear mapping above;
-- Energy actor: u_e = tanh(z_e), mapped to a 0–50 kW FCS power request.
-
-These are independent outputs from two separate actors; there is no fixed one-to-one correspondence between them. The environment then checks vehicle dynamics and powertrain feasibility. Maximum speed, no-reverse handling, battery power/SOC/current/voltage limits, EDU torque-speed/efficiency validity, and FCS limits can clip or change a request. A rule prior cannot bypass or modify these constraints.
+- Driving actor: `u_d ∈ [-1,1]`, then the piecewise mapping in Section 2 converts it to requested acceleration in [-1.5, 0.7] m/s².
+- Energy actor: `u_e ∈ [-1,1]`, then `P_req = 25(u_e+1) kW` converts it to requested FCS output power in [0,50] kW.
+- These are independent actors with separate observations and rewards. Neither actor receives the other actor's current selected action as part of its input.
+- The environment then checks vehicle dynamics and powertrain feasibility. Maximum speed, no-reverse handling, battery power/SOC/current/voltage limits, EDU torque-speed/efficiency validity, and FCS limits can clip or change a request. A rule prior cannot bypass or modify these constraints.
 
 ### 5. Current Reward Definition
 
-HASAC adds the driving reward and energy reward and gives both actors the **same shared team reward**. The coefficients below are from the current configuration:
+The independent SAC agents keep reward channels separate. The values below match `config/experiments/maddpg_individual_reward_g0999_500ep.json`, which is the current individual-reward reference configuration; they are not guaranteed to match another selected configuration. The driving agent optimizes the driving reward and the energy agent optimizes the energy reward. They do not receive a shared team reward.
 
 | Coefficient | Current value | Main purpose |
 |---|---:|---|
@@ -92,123 +91,109 @@ HASAC adds the driving reward and energy reward and gives both actors the **same
 | β₇ | 1 | Traffic-light prediction reward |
 | β₈ | 500 | Speed shaping before entering a lower-limit region |
 
-The main terms are below. A rule may assist with these objectives, but should not assume any one component is equivalent to the total reward.
+These reward functions and coefficients are training signals that explain the behavior encouraged by RL. The generated rule is a reference prior, not an implementation of the reward function. It does not need to reproduce every term, coefficient, or instantaneous reward calculation, and it should not mechanically optimize the equations step by step. Use them to understand task priorities and tradeoffs. The driving prior should support following with a safe, not excessively large gap while obeying speed limits and signals. The energy prior should support FCS power management, lower hydrogen use and component degradation, and SOC near its target. Keep the two agents' objectives and rewards distinct.
 
-**Following term.** Ego speed v is in m/s and gap d is in m:
+The driving reward is the sum of following, comfort, traffic-light, speeding, green-light crossing bonus, speed-limit-entry shaping, zero-speed negative-acceleration penalty, positive-acceleration-at-limit penalty, and terminal-penalty contributions. The energy reward is the sum of hydrogen, FCS degradation, battery SOH loss, EDU degradation, and SOC contributions.
 
-- D_safe = 2 + 0.5v + 0.0625v²; D_max = 10 + v + 0.0825v²; d_ref = 200 m.
-- For 0 ≤ d < D_safe: c_follow = C₀ − C₁(1 − d/D_safe)³, with C₀=5 and C₁=500.
-- For D_safe ≤ d ≤ D_max: c_follow = C₀.
-- For D_max < d < d_ref: c_follow = C₀ − C₂(d−D_max)/(d_ref−D_max), with C₂=5.
-- For d ≥ d_ref: c_follow = C₃ × (ego forward distance during this step / current-region speed limit in m/s), with C₃=5. Forward distance is in meters, so the ratio has units of seconds. This term is 0 when the lead gap is invalid.
-- The final following reward is β₀ c_follow.
+**Following term.** Use post-action executed ego speed `v_(t+1)` in m/s and post-action gap `d_(t+1)` in m:
 
-**Comfort.** c_comfort = −|a_t−a_(t−1)| / 2.2, where acceleration change is in m/s². The reward contribution is β₅ c_comfort. The divisor 2.2 comes from the requested-acceleration range 0.7−(−1.5).
+- `D_safe = 2 + 0.5v + 0.0625v²`; `D_max = 10 + v + 0.0825v²`; `d_ref = 200 m`.
+- For `0 ≤ d < D_safe`: `c_follow = C₀ − C₁(1 − d/D_safe)³`, with `C₀=5` and `C₁=500`.
+- For `D_safe ≤ d ≤ D_max`: `c_follow = C₀`.
+- For `D_max < d < d_ref`: `c_follow = C₀ − C₂(d−D_max)/(d_ref−D_max)`, with `C₂=5`.
+- For `d ≥ d_ref`: `c_follow = C₃ × (ego forward distance during this step / current-region speed limit in m/s)`, with `C₃=5`. Forward distance is in meters, so the ratio has units of seconds. This term is 0 when the lead gap is invalid.
+- The final following reward is `β₀ c_follow`.
 
-**Energy and degradation.** The implementation penalizes per-step increments: hydrogen term = −β₁ × hydrogen consumed during this step (g); FCS term = −β₂ × 100 × FCS degradation increment; battery term = −β₃ × 100 × battery SOH-loss increment; EDU term = −β₄ × 100 × EDU CLR increment. The factor 100 converts fractional increments to percentage points. The SOC term is −β₆ × |SOC−0.5|.
+**Comfort.** `c_comfort = −|a_exec,t−a_exec,t−1| / 2.2`, using actual executed acceleration in m/s². The reward contribution is `β₅ c_comfort`. The divisor 2.2 comes from the requested-acceleration range `0.7−(−1.5)`.
 
-**Traffic lights.** Estimate time to the stop line as t₁ = distance/current speed. A reward is applied only when speed > 0 and t₁ is less than the remaining time t₂ in the current phase. If the current phase is green, the raw reward is +C_green; if yellow or red, it is −C_non-green. Current values are C_green=C_non-green=5, multiplied by β₇=1. Crossing the stop line on green also gives a one-time +50 bonus. Crossing on red still terminates the episode; yellow crossing does not trigger this red-light termination condition.
+**Energy and degradation.** The implementation penalizes per-step increments: hydrogen term = `−β₁ × hydrogen consumed during this step (g)`; FCS term = `−β₂ × 100 × FCS degradation increment`; battery term = `−β₃ × 100 × battery SOH-loss increment`; EDU term = `−β₄ × 100 × EDU CLR increment`. The factor 100 converts fractional increments to percentage points. The SOC term is `−β₆ × |SOC−0.5|`.
 
-**Speed limits.** The current posted limit is 30 or 60 km/h. The continuous speeding term is −100 × max(v−v_limit,0)/v_limit. The vehicle's 70 km/h hard cap is separate from the posted limit. Before entering a lower-limit zone, the environment predicts entry speed using an assumed braking magnitude of 0.75 m/s²: v_entry = sqrt(max(0, v²−2×0.75×d_entry)); e = max(0,(v_entry−v_next_limit)/v_next_limit). Entry shaping is β₈×(e_t−e_(t+1)), with β₈=500. It applies only when approaching a lower-limit region; a red light is not treated as a zero speed limit. The implementation suppresses spurious positive boundary bonuses when the speed-region context changes or on a collision-termination step.
+**Traffic lights.** The reward is evaluated every step from pre-action speed, signal distance, current phase, and remaining phase time; it is not restricted to the 100 m posted-speed zone. Estimate time to the stop line as `t₁ = distance/current speed` and compare it with remaining time `t₂` in the current phase. A reward is active only when speed > 0 and `t₁ < t₂`. If the current phase is green, the raw reward is `+C_green`; if yellow or red, it is `−C_non-green`. Current values are `C_green=C_non-green=5`, multiplied by `β₇=1`. If `t₁ ≥ t₂`, no traffic-light reward is active for that step; recompute on the next step. Crossing the stop line on green also gives a one-time +50 bonus. The simulator terminates the episode for a red crossing; a yellow crossing currently does not trigger this termination condition. This reward uses the current observed phase; the rule's decision should consider the predicted phase at crossing within the stated finite horizon.
+
+**Speed limits.** The active posted limit is 30 or 60 km/h. The continuous speeding term uses post-action executed speed: `−100 × max(v_(t+1)−v_limit,0)/v_limit`. The vehicle's 70 km/h hard cap is separate from the posted limit. Before entering a lower-limit zone, the environment predicts entry speed using an assumed braking magnitude of 0.75 m/s²: `v_entry = sqrt(max(0, v²−2×0.75×d_entry))`; `e = max(0,(v_entry−v_next_limit)/v_next_limit)`. Entry shaping is `β₈×(e_t−e_(t+1))`, with `β₈=500`. It applies only when approaching a lower-limit region; a red light is not treated as a zero speed limit. The implementation suppresses spurious positive boundary bonuses when the speed-region context changes or on a collision-termination step.
 
 The extra penalty for negative acceleration at zero speed, the extra penalty for requesting positive acceleration at the speed limit, and all extra abnormal-termination penalties are currently 0.
 
 ### 6. Episode Termination Conditions
 
 - A collision reported by SUMO or a front gap ≤ 0 (vehicle overlap) terminates the episode early; the current additional terminal penalty is 0.
-- If the ego crosses a stop line while the signal was red before the crossing, the episode terminates early; the current additional penalty is 0. Yellow crossing does not trigger this condition.
+- The simulator terminates early when the signal state at the crossing instant is red; a yellow crossing does not trigger this termination condition, and the current additional penalty is 0.
 - The episode terminates early when ego speed reaches or exceeds 120% of the active posted limit; the current additional penalty is 0. The threshold is 36 km/h in a 30 km/h zone and 72 km/h on an ordinary 60 km/h road. The 70 km/h vehicle hard cap makes the ordinary-road 72 km/h termination threshold unreachable. The continuous speeding reward still applies below the termination threshold.
 - The episode ends normally when the lead reaches its terminal stop and stops, or when the ego completes its route.
 - The 6000 s time limit produces a truncation.
 - The 300 m gap diagnostic threshold and 1000 m monitoring threshold are logging-only and do not terminate episodes. There is no long-stationary termination condition.
 - Collision, red-light, and speeding terminations currently have no extra negative terminal reward; their main effect is ending the episode.
-- The current HASAC configuration uses discount factor gamma=0.99. Training uses random warm-up followed by Gaussian-policy sampling; the rule prior participates only in actor-policy stages.
-- The environment distinguishes terminated from time-limit truncated; the current training code stores either case as the replay buffer's done flag.
 
-### 7. Fusion of the Rule Prior and HASAC Actor
+### 7. SAC Gaussian Rule Prior and Fusion
 
-The rule program does not return physical acceleration or kW. It returns each actor's latent Gaussian parameters before tanh: prior mean μ_prior and standard deviation σ_prior. Each HASAC actor predicts mean and log_std; log_std is clamped to [-20, 2], then σ_actor=exp(log_std). Mean and standard deviation are fused independently:
+The rule program returns a distribution prior for each actor in the actor's latent space before `tanh`; it does not return physical acceleration, kW, or a sampled action. For actor `i` (driving or energy), let the SAC actor predict `μ_actor^i` and `σ_actor^i = exp(log_std_actor^i)`. The rule returns `μ_prior^i` and nonnegative `σ_prior^i`. The integration wrapper fuses mean and standard deviation independently:
 
-- μ_f = (1−λ₀) μ_actor + λ₀ μ_prior
-- σ_f = (1−λ₁) σ_actor + λ₁ σ_prior
+`μ_f^i = (1−λ_μ^i) μ_actor^i + λ_μ^i μ_prior^i`
 
-The current values are λ₀=0.5 and λ₁=0.5. During training, the fused distribution is sampled as z=μ_f+σ_f ε, where ε~Normal(0,1); deterministic evaluation uses z=μ_f. Then u=tanh(z), followed by the physical action mapping in Section 4. Thus, the rule affects the action by changing the actor's mean and standard deviation; it does not overwrite the actor's action. σ_prior=0 means the rule recommends a zero-variance prior, but the fused or sampled action is not necessarily deterministic: when λ₁<1, part of the actor's standard deviation remains.
+`σ_f^i = (1−λ_σ^i) σ_actor^i + λ_σ^i σ_prior^i`
 
-The first 1000 environment steps are replay warm-up, during which actions are sampled uniformly at random and the actor/prior fusion is not called. The prior is used in subsequent actor sampling and HASAC updates.
+The mean and standard-deviation weights are external configuration values, independent of each other and of the rule program. They may also be set separately for driving and energy. Use 0.5 for each weight only as an illustrative default; never hard-code the weights into the rule. `active=False` bypasses fusion for that actor on that observation. If `σ_prior=0` and `λ_σ<1`, the fused policy remains stochastic because the SAC actor still contributes standard deviation.
 
-### 8. Rule Program Input/Output Interface
+For stochastic SAC action selection, sample the fused distribution as `z = μ_f + σ_f ε`, where `ε ~ Normal(0,1)`, then compute `u=tanh(z)` and apply the physical mapping in Section 4. Deterministic action selection uses `u=tanh(μ_f)`. The rule changes the actor distribution but does not directly override the sampled or mapped action. Evaluate the rule from the current observation at each 1 s decision step.
 
-The module is selected by the external configuration field `llm_prior.program_name` and is loaded from `llm-prior/programs/<program_name>.py`. The command line can override it with `--prior-program-name <program_name>`. The prior must also be enabled in the configuration. The program must implement:
+### 8. Rule Program Interface
 
-    def predict(observation):
-        ...
+Design a Python module exposing `predict(observation)`. The program receives the full raw observation as a NumPy array shaped `(15,)` or `(batch,15)`, even though the SAC actors receive their separate normalized views. It must convert inputs to `float32`, validate shape and finite values, support single and batch inputs, and deterministically return both agent entries. Use one scalar per row; `(batch,1)` arrays are recommended:
 
-`observation` is a NumPy array shaped `(15,)` for one state or `(batch, 15)` for a batch, containing the full raw observation described in Section 3. Convert it to float32 and process it internally as a batch; recommended outputs have shape `(batch, 1)`. Return a mapping containing both driving and energy:
+```python
+{
+    "driving": {"mean": driving_prior_mean, "std": driving_prior_std, "active": driving_active},
+    "energy":  {"mean": energy_prior_mean,  "std": energy_prior_std,  "active": energy_active},
+}
+```
 
-    {
-        "driving": {"mean": ..., "std": ..., "active": ...},
-        "energy":  {"mean": ..., "std": ..., "active": ...},
-    }
-
-- Both actors have action dimension 1, so each mean/std is one finite scalar; `(batch,1)` arrays are recommended.
-- Mean/std must be in the latent Gaussian space before tanh; std must be finite and nonnegative.
-- `active` is an optional Boolean mask, recommended shape `(batch,1)`. If omitted, it defaults to True. `active=False` means the prior is not fused for that actor/state.
-- One program can provide a prior for driving, energy, or both. Set `active=False` for an actor the rule does not intend to control.
-- Support single and batch inputs; reject invalid dimensions, NaN, and Inf. Return the same distribution parameters deterministically for the same input. Do not sample actions inside `predict`.
-- NumPy is allowed. Do not use network services, API keys, online LLM calls, file I/O, environment globals, or HASAC internals. The program only returns distribution parameters; existing HASAC code handles fusion, sampling, and physical mapping.
+- Each actor has one action dimension. `mean` must be finite and expressed in pre-`tanh` latent Gaussian units. `std` must be finite and nonnegative; it is a standard deviation, not `log_std` or variance.
+- `active` is an optional Boolean or batch-shaped Boolean mask; if omitted it defaults to `True`. A conditional rule may set `active=False` when it has no justified prior for that actor/state. The program is still evaluated once each environment step.
+- The program may provide a prior for driving, energy, or both. It must not make either actor's decisions depend on an unobserved current action from the other actor.
+- Return the same distribution parameters deterministically for the same observation. Do not sample actions inside `predict` or add exploration noise.
+- NumPy is allowed. Do not use network services, API keys, online LLM calls, file I/O, environment globals, or SAC internals. The program returns prior parameters only; fusion, SAC sampling, and physical action mapping follow the definitions above.
 - Any new thresholds or coefficients must be clearly named rule hyperparameters with an explanation. Do not silently change the simulation environment, rewards, powertrain parameters, or hard constraints. Explicitly identify unavailable physical signals; do not fabricate them.
 
 ### 9. Minimal Interface Example: Recommend Braking Above the Current Limit
 
-This minimal example demonstrates the interface and latent-mean definition; it is not a complete driving policy and does not handle following, traffic lights, or energy management. The target normalized action is −0.999, whose pre-tanh mean is atanh(−0.999)≈−3.8002. When ego speed is not above the current limit, the prior is inactive. When above the limit, only the driving prior is active. The energy prior is always inactive.
+This example demonstrates the prior interface and latent-mean definition; it is not a complete driving policy and does not handle following, traffic lights, or energy management. The target normalized action is `−0.999`, represented by prior mean `atanh(−0.999)≈−3.8002`. Its prior standard deviation is 0.05. When ego speed does not exceed the current limit, the driving prior is inactive. The energy prior is always inactive.
 
-    import numpy as np
+```python
+import numpy as np
 
-    TARGET_U = -0.999
-    TARGET_MEAN = float(np.arctanh(TARGET_U))
+TARGET_U = -0.999
+TARGET_MEAN = float(np.arctanh(TARGET_U))
 
-    def predict(observation):
-        x = np.asarray(observation, dtype=np.float32)
-        if x.ndim == 1:
-            x = x.reshape(1, -1)
-        if x.ndim != 2 or x.shape[1] != 15:
-            raise ValueError("observation must have shape (15,) or (batch, 15)")
-        if not np.all(np.isfinite(x)):
-            raise ValueError("observation must contain only finite values")
+def predict(observation):
+    x = np.asarray(observation, dtype=np.float32)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if x.ndim != 2 or x.shape[1] != 15:
+        raise ValueError("observation must have shape (15,) or (batch, 15)")
+    if not np.all(np.isfinite(x)):
+        raise ValueError("observation must contain only finite values")
 
-        batch = x.shape[0]
-        speed = x[:, 5]
-        current_limit = x[:, 12]
-        active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
-        drive_mean = np.zeros((batch, 1), dtype=np.float32)
-        drive_mean[active_drive, 0] = TARGET_MEAN
-        zeros = np.zeros((batch, 1), dtype=np.float32)
-        inactive = np.zeros((batch, 1), dtype=bool)
-        return {
-            "driving": {
-                "mean": drive_mean,
-                "std": zeros.copy(),
-                "active": active_drive.reshape(batch, 1),
-            },
-            "energy": {
-                "mean": zeros.copy(),
-                "std": zeros.copy(),
-                "active": inactive,
-            },
-        }
+    batch = x.shape[0]
+    speed = x[:, 5]
+    current_limit = x[:, 12]
+    active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
+    drive_mean = np.zeros((batch, 1), dtype=np.float32)
+    drive_mean[active_drive, 0] = TARGET_MEAN
+    drive_std = np.full((batch, 1), 0.05, dtype=np.float32)
+    zeros = np.zeros((batch, 1), dtype=np.float32)
+    inactive = np.zeros((batch, 1), dtype=bool)
+    return {
+        "driving": {
+            "mean": drive_mean,
+            "std": drive_std,
+            "active": active_drive.reshape(batch, 1),
+        },
+        "energy": {"mean": zeros.copy(), "std": zeros.copy(), "active": inactive},
+    }
+```
 
-For example, if observation[5]=18 m/s and observation[12]=16.6667 m/s, the driving prior has mean≈−3.8002, std=0, and active=True. With λ₀=0.5, the fused mean is the average of the actor mean and −3.8002. Gaussian sampling still occurs during training, followed by tanh and physical action mapping. The environment may still clip the result due to maximum speed, no-reverse handling, or powertrain feasibility.
+For example, if `observation[5]=18 m/s` and `observation[12]=16.6667 m/s`, the driving prior is active and proposes a latent mean near −3.8002; the energy prior is inactive. The final stochastic action still depends on the externally configured fusion weights and SAC actor distribution.
 
-### 10. Required Output
+### 10. Required Response
 
-Output only the following two sections, with enough detail for review and direct integration:
-
-**A. Executable Python program**
-
-Provide the complete source code, with a suggested filename `<program_name>.py`, which can be placed in `llm-prior/programs/` and imported by the existing HASAC loader. It must implement `predict(observation)` as specified above. If the rule is parameterized, it may also provide `build_prior(config)`, but prediction capability must still be available. Include input shape/finite-value checks, single and batch handling, outputs for both agents, and necessary comments. Do not provide pseudocode, ellipses, or fragments that depend on unavailable files.
-
-**B. Explanation of the rule's behavior**
-
-Explain the rule's objective, observation indices used, each trigger condition and priority, how mean/std/active are set for both actors, how λ fusion affects actions, how boundaries and missing targets are handled, and any new hyperparameters and their rationale. Include at least one 15-dimensional test observation and a summary of its expected output. Explain how to set `llm_prior.program_name` and run an interface smoke test. Be candid about what the rule can and cannot improve, especially that it cannot guarantee optimal unobserved motor losses or replace the policy learned by HASAC.
-
-Do not claim that the example has already been trained or validated in SUMO. Do not change environment parameters, add observation fields, return physical actions, or let the program bypass episode termination or vehicle/battery/EDU physical constraints.
+Return (A) the complete Python module with a suggested filename and (B) a concise, precise explanation of its task logic, observations, prior triggers, `active` masks, mean/std values, and limits. Explain how the Gaussian prior would affect the SAC actor after external fusion and `tanh`, and distinguish the prior from the final executed action. Identify assumptions, unavailable signals, and any added rule hyperparameters. Do not provide a test suite, request code execution, or claim that the rule was executed or validated in SUMO.

@@ -766,6 +766,7 @@ def main(argv=None):
     tr["episodes"] = episodes
     tr["learning_starts"] = learning_starts
     tr["batch_size"] = batch_size
+    tr["algorithm"] = algorithm_name
     tr["actor_hidden_activation"] = "LeakyReLU(negative_slope=0.01)"
     tr["critic_hidden_activation"] = "ReLU"
     tr["energy_observation_features"] = [
@@ -1746,7 +1747,7 @@ def main(argv=None):
         "agent_observation_dimensions": (
             {"driving": agent.driving_state_dim, "energy": agent.energy_state_dim}
             if isinstance(agent, (HASAC, MAPPO, MADDPG)) else
-            {"driving": 11, "energy": 5}
+            {"driving": 11, "energy": 6}
             if isinstance(agent, TwoAgentSAC) else
             {"joint": env.observation_space.shape[0]}
         ),
