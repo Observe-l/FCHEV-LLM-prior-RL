@@ -124,47 +124,61 @@ Driving reward 是 following、comfort、traffic-light、speeding、绿灯越线
 - 300 m 跟车距离诊断阈值和 1000 m 监控阈值只用于日志，不终止 episode。没有长时间静止终止条件。
 - 碰撞、闯红灯和超速终止目前没有额外负的 terminal reward；主要影响是 episode 结束。
 
-### 7. SAC 高斯 Rule Prior 与融合
+### 7. 多 Rule 选择与 SAC Prior 融合
 
-Rule program 为每个 actor 输出其 `tanh` 前 latent 空间中的分布 prior，不返回物理加速度、kW 或采样后的 action。对 agent `i`（driving 或 energy），SAC actor 预测 `μ_actor^i` 和 `σ_actor^i = exp(log_std_actor^i)`。Rule 输出 `μ_prior^i` 和非负的 `σ_prior^i`。集成 wrapper 独立融合 mean 和 standard deviation：
+请生成一个 Python program，在其中定义多个有独立名称的 rule。不同 rule 可以面向不同任务阶段，例如跟车、接近红绿灯、进入限速区域或能量管理。Program 还要包含一个 selector，负责选择本阶段使用的一个 rule，并同时给出该 rule 的 prior 权重 `lambda`。这是生成的 Python 程序内部的决策逻辑，不是在运行时调用在线 LLM。
 
-`μ_f^i = (1−λ_μ^i) μ_actor^i + λ_μ^i μ_prior^i`
+Selector 每隔 `K` 个环境 step 调用一次（默认 `K=5`，每个 step 为 1 s）；每个 episode 在 step 0 首次调用。所选 rule 名称和 `lambda` 在下一次选择时保持不变。在这段间隔内，所选 rule 函数仍会在每个 1 s step 使用最新的原始 observation 重新计算 prior，因此 prior 数值可以随状态变化，rule 身份和权重则保持不变。训练命令可以配置该间隔。不要在生成的 program 中维护计数器或隐藏可变状态；选择间隔由运行框架控制。
 
-`σ_f^i = (1−λ_σ^i) σ_actor^i + λ_σ^i σ_prior^i`
+对每个 agent `i`（driving 或 energy），所选 rule 可以返回其 `tanh` 前 latent Gaussian prior `(mu_prior^i, sigma_prior^i)` 和 `active` 标记。SAC actor 给出 `(mu_actor^i, sigma_actor^i)`，其中 `sigma_actor = exp(log_std_actor)`。Selector 输出的单个标量 `lambda` 同时用于该 rule 的 mean、standard deviation 融合，并由两个 agent 共用；`active=False` 会单独跳过对应 agent 的融合：
 
-Mean 与标准差的融合权重由外部配置提供，二者彼此独立，也与 rule program 无关；Driving 和 Energy 还可以分别配置。只有在没有其他指定时，才可将 0.5 作为示意默认值；不要将融合权重硬编码在 rule 里。对某个 agent/state，`active=False` 表示绕过该 prior，不做融合。若 `σ_prior=0` 且 `λ_σ<1`，由于 SAC actor 仍贡献一部分标准差，融合后的策略依然是随机策略。
+`lambda_eff^i = lambda`（该 agent prior 激活时），否则 `lambda_eff^i = 0`
 
-SAC 随机选取 action 时，从融合分布采样 `z = μ_f + σ_f ε`，其中 `ε ~ Normal(0,1)`；之后执行 `u=tanh(z)` 并使用第 4 节中的物理 action 映射。确定性 action 使用 `u=tanh(μ_f)`。Rule 改变 actor 的分布，但不直接覆盖采样或映射后的 action。每个 1 s 决策 step 都根据当步 observation 计算 rule。
+`mu_f^i = (1-lambda_eff^i) mu_actor^i + lambda_eff^i mu_prior^i`
 
-### 8. Rule Program 输入/输出接口
+`sigma_f^i = (1-lambda_eff^i) sigma_actor^i + lambda_eff^i sigma_prior^i`
 
-设计一个暴露 `predict(observation)` 的 Python 模块。程序接收完整原始 observation，形式为 NumPy 数组 `(15,)` 或 `(batch,15)`，而不是 SAC actor 的分离后归一化输入。将输入转换为 `float32`，检查形状和有限值，支持单条及 batch 输入，并确定性地返回两个 agent 的 prior。每行每个 agent 输出一个标量，建议使用 `(batch,1)`：
+`lambda` 必须在 `[0,1]` 范围内。若 selector 不选择 rule，返回 `rule_name=None`（或 `"none"`）且 `lambda=0`。Rule 的 `std` 是标准差，不能返回方差或 `log_std`；允许返回 0。仅当激活融合会导致标准差为 0 时，运行框架才会施加很小的正数下限以保证数值稳定。
+
+SAC 随机采样使用 `z = mu_f + sigma_f * epsilon`，其中 `epsilon ~ Normal(0,1)`，再计算 `u=tanh(z)`，并按第 4 节映射为物理 action。确定性评估使用 `u=tanh(mu_f)`。Prior 改变 action 分布，但不直接输出最终 action，也不能覆盖环境约束。
+
+训练时，replay buffer 会为当前和下一 observation 保存实际融合后执行的 action，以及对应的 prior 参数和权重。SAC 计算 bootstrap target 时使用该 transition 对应的下一状态 prior，计算 actor objective 时使用当前状态 prior，以适应训练过程中变化的 rule 和 `lambda`。当 `lambda=0` 时，prior 融合不起作用，action 分布退化为普通 SAC。
+
+### 8. Rule Program 接口
+
+输出单个可导入的 Python 模块，并定义以下内容：
+
+- `RULES`：将每个 rule 名称映射到对应 rule 函数的字典。至少提供两个不同的 rule 函数。
+- `select_rule(observation)`：rule 选择器。输入是一条完整、原始 observation，类型为 `float32` NumPy array，形状为 `(15,)`。返回 `{"rule_name": <RULES 中的名称>, "lambda": <[0,1] 内浮点数>}`。也可以返回 `{"rule_name": None, "lambda": 0.0}` 表示不使用 prior。
+
+`RULES` 中的每个 rule 函数都接收完整、原始、未归一化的 observation，类型为 `float32` NumPy array，形状为 `(batch,15)`；即使对某个或两个 agent 均不启用 prior，也必须返回两个 agent 对应的条目。运行框架每次传入的 batch size 为 1。使用 `(batch,1)` 形状的数组：
 
 ```python
 {
-    "driving": {"mean": driving_prior_mean, "std": driving_prior_std, "active": driving_active},
-    "energy":  {"mean": energy_prior_mean,  "std": energy_prior_std,  "active": energy_active},
+    "driving": {"mean": drive_mean, "std": drive_std, "active": drive_active},
+    "energy":  {"mean": energy_mean, "std": energy_std, "active": energy_active},
 }
 ```
 
-- 每个 actor 的 action 维度为 1。`mean` 必须为有限值，单位是 `tanh` 前的 latent Gaussian 空间。`std` 必须为有限的非负标准差，不是 `log_std` 或方差。
-- `active` 是可选布尔值或 batch 布尔 mask；省略时默认 `True`。若 rule 对某个 agent/state 没有合理建议，可以设置 `active=False`。Rule program 仍须每个环境 step 调用一次。
-- 一个 program 可为 driving、energy 或二者提供 prior。不得让某个 agent 的决策依赖其 observation 中不可见的另一个 agent 当前 action。
-- 同一 observation 必须确定性地返回相同分布参数。不要在 `predict` 内采样 action 或添加探索噪声。
-- 可以使用 NumPy。不要调用网络服务、API key、在线 LLM、文件 IO、环境全局变量或 SAC 内部对象。Program 只返回 prior 参数；融合、SAC 采样和物理 action 映射按上文定义执行。
-- 新增的阈值或系数必须使用清晰命名的 rule 超参数并解释。不得暗中修改仿真环境、reward、动力系统参数或硬约束。明确列出不可直接观测的物理信号；不要编造数据。
+- 每个 actor 的 action 维度为 1。`mean` 使用 `tanh` 前 latent 空间；`std` 必须是有限的非负值。`active` 为布尔标量或 batch 布尔数组。当该 rule 对当前状态下的对应 agent 没有 prior 建议时，将其设为 `False`。
+- 对相同 observation，`select_rule` 必须确定性地返回相同选择；rule 函数也必须返回确定的分布参数。不得在 program 内采样 action 或加入探索噪声。
+- 检查 observation 形状及有限数值。可以使用 NumPy。不要使用网络服务、API key、在线 LLM、文件 IO、环境全局变量或 SAC 内部对象。
+- 不要假设 rule 函数只在选择边界调用：所选 rule 会在每个环境 step 使用最新 observation 执行。
+- 不得让任一 agent 的 prior 依赖其 observation 中看不到的另一个 agent 当前 action。两个 agent 都根据同一份 action 执行前的 observation 决策。
+- 新增的阈值或系数必须使用清晰名称。不得暗中修改仿真、reward、动力系统参数或环境约束。代码只能使用 observation 中已有的信息，不得假设可直接获取未提供的物理信号。
 
-### 9. 最小接口示例：超过当前限速时建议制动
+### 9. 多 Rule 接口示例
 
-此示例用于说明 prior 接口和 latent mean 定义；它不是完整驾驶策略，也不处理跟车、红绿灯或能量管理。目标归一化 action 为 `−0.999`，对应 prior mean `atanh(−0.999)≈−3.8002`，prior 标准差为 0.05。当 ego 速度没有超过当前限速时，驾驶 prior 不激活。Energy prior 始终不激活。
+下面示例展示两个可选 rule，以及 selector 同时选择 rule 名称和动态 `lambda`。它只用于说明接口，不是完整车辆策略，也没有完整处理跟车、红绿灯或能量管理。
 
 ```python
 import numpy as np
 
 TARGET_U = -0.999
-TARGET_MEAN = float(np.arctanh(TARGET_U))
+BRAKE_MEAN = float(np.arctanh(TARGET_U))
+PRIOR_STD = 0.05
 
-def predict(observation):
+def _observation_batch(observation):
     x = np.asarray(observation, dtype=np.float32)
     if x.ndim == 1:
         x = x.reshape(1, -1)
@@ -172,28 +186,48 @@ def predict(observation):
         raise ValueError("observation must have shape (15,) or (batch, 15)")
     if not np.all(np.isfinite(x)):
         raise ValueError("observation must contain only finite values")
+    return x
 
+def select_rule(observation):
+    x = np.asarray(observation, dtype=np.float32)
+    if x.shape != (15,) or not np.all(np.isfinite(x)):
+        raise ValueError("selector observation must be a finite array with shape (15,)")
+    speed = float(x[5])
+    current_limit = float(x[12])
+    if current_limit > 0.0 and speed > current_limit:
+        return {"rule_name": "brake_above_limit", "lambda": 0.4}
+    return {"rule_name": "coast_within_limit", "lambda": 0.2}
+
+def _make_prior(observation, braking):
+    x = _observation_batch(observation)
     batch = x.shape[0]
-    speed = x[:, 5]
-    current_limit = x[:, 12]
-    active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
-    drive_mean = np.zeros((batch, 1), dtype=np.float32)
-    drive_mean[active_drive, 0] = TARGET_MEAN
-    drive_std = np.full((batch, 1), 0.05, dtype=np.float32)
+    drive_mean = np.full((batch, 1), BRAKE_MEAN if braking else 0.0, dtype=np.float32)
+    drive_std = np.full((batch, 1), PRIOR_STD, dtype=np.float32)
+    drive_active = np.ones((batch, 1), dtype=bool)
     zeros = np.zeros((batch, 1), dtype=np.float32)
     inactive = np.zeros((batch, 1), dtype=bool)
     return {
-        "driving": {
-            "mean": drive_mean,
-            "std": drive_std,
-            "active": active_drive.reshape(batch, 1),
-        },
+        "driving": {"mean": drive_mean, "std": drive_std, "active": drive_active},
         "energy": {"mean": zeros.copy(), "std": zeros.copy(), "active": inactive},
     }
+
+def rule_brake_above_limit(observation):
+    return _make_prior(observation, braking=True)
+
+def rule_coast_within_limit(observation):
+    return _make_prior(observation, braking=False)
+
+RULES = {
+    "brake_above_limit": rule_brake_above_limit,
+    "coast_within_limit": rule_coast_within_limit,
+}
 ```
 
-例如，若 `observation[5]=18 m/s` 且 `observation[12]=16.6667 m/s`，Driving prior 激活并给出约 −3.8002 的 latent mean；Energy prior 不激活。最终随机 action 仍取决于外部融合权重和 SAC actor 分布。
+示例中的 selector 只在配置的间隔边界调用；在间隔中的每个 step，选定的函数仍会收到最新 observation 并执行。这个示例里的一个 `lambda` 同时作用于所有激活 agent prior 的 mean 和 standard deviation。最终随机 action 也取决于 SAC actor 分布和高斯采样。
 
 ### 10. 输出要求
 
-请输出：(A) 完整 Python 模块及建议文件名；(B) 对 rule 逻辑、使用的 observation、触发条件、`active` mask、mean/std 数值范围和边界的准确简要说明。说明高斯 prior 如何经过外部融合和 `tanh` 影响 SAC actor，并区分 prior 与最终执行 action。明确列出假设、不可用的信号和新增的 rule 超参数。不要提供测试套件，不要要求执行代码，也不要声称代码已在 SUMO 中运行或验证。
+输出包括以下两部分：
+
+1. 可执行的 Python rule program，包含 `RULES` 和选择 rule 并给出 `lambda` 的 `select_rule` 函数，符合本节定义的输入输出接口。
+2. 一张简洁表格，逐项列出每种 rule 的名称、简要描述，以及该 rule 对应的任务阶段，例如跟车、接近信号灯、限速区域或能量管理。

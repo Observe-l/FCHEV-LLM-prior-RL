@@ -56,6 +56,8 @@ TRACE_FIELDS = [
     "policy_driving_prior_lambda_0", "policy_driving_prior_lambda_1",
     "policy_energy_prior_mean", "policy_energy_prior_std", "policy_energy_prior_active",
     "policy_energy_prior_lambda_0", "policy_energy_prior_lambda_1",
+    "policy_selected_rule_name", "policy_rule_lambda",
+    "policy_rule_selection_updated",
     "policy_maddpg_rule_mode", "policy_maddpg_rule_lambda",
     "policy_maddpg_driving_actor_unit", "policy_maddpg_energy_actor_unit",
     "policy_maddpg_driving_rule_value", "policy_maddpg_energy_rule_value",
@@ -546,6 +548,8 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
     )
     for i in range(episodes):
         obs, reset_info = env.reset(seed=base_seed + i)
+        if isinstance(agent, TwoAgentSAC):
+            agent.reset_rule_prior()
         total = 0.0
         hydrogen = 0.0
         steps = 0
@@ -564,8 +568,19 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
                 driving_state, energy_state = split_agent_observations(
                     obs, vehicle_cfg, normalization_enabled
                 )
-                driving_action = agent.driving.select_action(driving_state, deterministic=True)
-                energy_action = agent.energy.select_action(energy_state, deterministic=True)
+                rule_decision = agent.rule_prior_for_step(obs, steps)
+                prior_output = rule_decision.prior if rule_decision is not None else None
+                prior_lambda = rule_decision.lambda_value if rule_decision is not None else 0.0
+                driving_action = agent.driving.select_action(
+                    driving_state, deterministic=True,
+                    prior=prior_output.driving if prior_output is not None else None,
+                    prior_lambda=prior_lambda,
+                )
+                energy_action = agent.energy.select_action(
+                    energy_state, deterministic=True,
+                    prior=prior_output.energy if prior_output is not None else None,
+                    prior_lambda=prior_lambda,
+                )
                 physical_action = map_split_actions(
                     driving_action, energy_action, env.action_space
                 )
@@ -685,6 +700,14 @@ def main(argv=None):
         help="Override llm_prior.program_name for HASAC priors or MADDPG rule programs",
     )
     parser.add_argument(
+        "--rule-prior-program-name", default=None,
+        help="Enable the multi-rule Gaussian prior program for independent SAC",
+    )
+    parser.add_argument(
+        "--rule-selection-interval-steps", type=int, default=None,
+        help="How many 1 s control steps to hold a selected rule and lambda (default: 5)",
+    )
+    parser.add_argument(
         "--maddpg-rule-output-mode",
         choices=MADDPG_RULE_MODES,
         default=None,
@@ -697,6 +720,18 @@ def main(argv=None):
     parser.add_argument(
         "--resume-checkpoint", default=None,
         help="Resume a checkpoint produced by the selected algorithm",
+    )
+    parser.add_argument(
+        "--resume-run-dir", default=None,
+        help="Continue writing into an existing run directory (requires --resume-checkpoint)",
+    )
+    parser.add_argument(
+        "--resume-episode", type=int, default=None,
+        help="Last episode number already recorded in --resume-run-dir; training continues at the next episode",
+    )
+    parser.add_argument(
+        "--checkpoint-episode", type=int, default=None,
+        help="Episode represented by --resume-checkpoint (for recording recovery lag)",
     )
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--output-root", default="results")
@@ -713,6 +748,18 @@ def main(argv=None):
     if args.prior_program_name is not None:
         cfg.setdefault("llm_prior", {})["program_name"] = args.prior_program_name
     algorithm_name = (args.algorithm or cfg["training"]["algorithm"]).lower()
+    if args.rule_prior_program_name is not None:
+        if algorithm_name != "sac":
+            raise ValueError("--rule-prior-program-name is only supported with independent --algorithm sac")
+        prior_cfg = cfg.setdefault("llm_prior", {})
+        prior_cfg["enabled"] = True
+        prior_cfg["program_name"] = args.rule_prior_program_name
+    if args.rule_selection_interval_steps is not None:
+        if algorithm_name != "sac":
+            raise ValueError("--rule-selection-interval-steps is only supported with independent --algorithm sac")
+        cfg.setdefault("llm_prior", {})["selection_interval_steps"] = int(
+            args.rule_selection_interval_steps
+        )
     resume_checkpoint = None
     if args.resume_checkpoint is not None:
         resume_checkpoint = Path(args.resume_checkpoint)
@@ -721,11 +768,24 @@ def main(argv=None):
         resume_checkpoint = resume_checkpoint.resolve()
         if not resume_checkpoint.is_file():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint}")
-        if algorithm_name not in ("hasac", "mappo", "maddpg"):
-            raise ValueError("--resume-checkpoint currently supports HASAC, MAPPO, and MADDPG")
+        if algorithm_name not in ("sac", "hasac", "mappo", "maddpg"):
+            raise ValueError("--resume-checkpoint currently supports SAC, HASAC, MAPPO, and MADDPG")
         cfg["training"]["resume_checkpoint"] = str(resume_checkpoint)
         cfg["training"]["resume_replay_buffer"] = False
     resumed_from_checkpoint = resume_checkpoint is not None
+    if args.resume_run_dir is not None:
+        if not resumed_from_checkpoint:
+            raise ValueError("--resume-run-dir requires --resume-checkpoint")
+        if args.resume_episode is None or args.resume_episode < 0:
+            raise ValueError("--resume-run-dir requires a non-negative --resume-episode")
+        if args.checkpoint_episode is None:
+            args.checkpoint_episode = args.resume_episode
+        if args.checkpoint_episode < 0 or args.checkpoint_episode > args.resume_episode:
+            raise ValueError("--checkpoint-episode must be between 0 and --resume-episode")
+        if algorithm_name != "sac":
+            raise ValueError("--resume-run-dir currently supports independent SAC runs")
+    elif args.resume_episode is not None or args.checkpoint_episode is not None:
+        raise ValueError("--resume-episode and --checkpoint-episode require --resume-run-dir")
     tr = dict(cfg["training"])
     maddpg_rule_mode = str(
         args.maddpg_rule_output_mode
@@ -789,8 +849,30 @@ def main(argv=None):
         if not experiment_label:
             raise ValueError("--experiment-name must contain at least one letter or number")
         run_name = f"{algorithm_name}_{experiment_label}_{stamp}_seed{seed}"
-    run_dir = (root / args.output_root / run_name).resolve()
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if args.resume_run_dir is not None:
+        run_dir = Path(args.resume_run_dir)
+        if not run_dir.is_absolute():
+            run_dir = root / run_dir
+        run_dir = run_dir.resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Resume run directory not found: {run_dir}")
+        episodes_path = run_dir / "episodes.csv"
+        if not episodes_path.is_file():
+            raise FileNotFoundError(f"Existing run has no episodes.csv: {episodes_path}")
+        existing_rows = _read_episode_rows(episodes_path)
+        existing_episode_numbers = [int(row["episode"]) for row in existing_rows]
+        if not existing_episode_numbers or max(existing_episode_numbers) != args.resume_episode:
+            raise ValueError(
+                "--resume-episode must match the last recorded episode in episodes.csv "
+                f"(requested {args.resume_episode}, found {max(existing_episode_numbers) if existing_episode_numbers else 'none'})"
+            )
+        if episodes <= args.resume_episode:
+            raise ValueError(
+                f"Target --episodes ({episodes}) must exceed the resume episode ({args.resume_episode})"
+            )
+    else:
+        run_dir = (root / args.output_root / run_name).resolve()
+        run_dir.mkdir(parents=True, exist_ok=False)
     # Keep the requested singular filename available while preserving the
     # established losses.csv name without duplicating a potentially large log.
     try:
@@ -810,37 +892,41 @@ def main(argv=None):
         "independent_driving_and_energy_sac" if algorithm_name == "sac" else
         "single_agent"
     )
-    with (run_dir / "config.json").open("w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    with (run_dir / "checkpoint_policy.json").open("w", encoding="utf-8") as f:
-        json.dump({
-            "top_reward_checkpoints": 5,
-            "ranking_metric": "episode return",
-            "final_checkpoint": "final_episode_<episode_count>.pt",
-            "rolling_recovery_checkpoint": "final.pt",
-            "checkpoint_contents": "full agent and optimizer state",
-            "agents": (
-                ["driving", "energy_management"]
-                if algorithm_name in ("sac", "hasac", "mappo", "maddpg") else ["joint"]
-            ),
-            "hasac_critic": "centralized twin soft Q over joint state and actions"
-            if algorithm_name == "hasac" else None,
-            "hasac_reward": "same shared reward for both agents: driving_reward + energy_reward"
-            if algorithm_name == "hasac" else None,
-            "mappo_critic": "centralized value function over the full 15-dimensional normalized state"
-            if algorithm_name == "mappo" else None,
-            "mappo_reward": "same shared team reward for both decentralized actors"
-            if algorithm_name == "mappo" else None,
-            "maddpg_critics": "two centralized critics over the full 15-dimensional state and joint action"
-            if algorithm_name == "maddpg" else None,
-            "maddpg_reward": "driving critic uses driving reward; energy critic uses energy reward"
-            if algorithm_name == "maddpg" else None,
-            "maddpg_rule_output_mode": maddpg_rule_mode if algorithm_name == "maddpg" else None,
-            "maddpg_rule_program": maddpg_rule_program if algorithm_name == "maddpg" else None,
-            "maddpg_rule_lambda": maddpg_rule_lambda if algorithm_name == "maddpg" else None,
-        }, f, indent=2)
-    top_reward_checkpoints = []
-    _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
+    if args.resume_run_dir is None:
+        with (run_dir / "config.json").open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        with (run_dir / "checkpoint_policy.json").open("w", encoding="utf-8") as f:
+            json.dump({
+                "top_reward_checkpoints": 5,
+                "ranking_metric": "episode return",
+                "final_checkpoint": "final_episode_<episode_count>.pt",
+                "rolling_recovery_checkpoint": "final.pt",
+                "checkpoint_contents": "agent and optimizer state; replay buffer is not included",
+                "agents": (
+                    ["driving", "energy_management"]
+                    if algorithm_name in ("sac", "hasac", "mappo", "maddpg") else ["joint"]
+                ),
+                "hasac_critic": "centralized twin soft Q over joint state and actions"
+                if algorithm_name == "hasac" else None,
+                "hasac_reward": "same shared reward for both agents: driving_reward + energy_reward"
+                if algorithm_name == "hasac" else None,
+                "mappo_critic": "centralized value function over the full 15-dimensional normalized state"
+                if algorithm_name == "mappo" else None,
+                "mappo_reward": "same shared team reward for both decentralized actors"
+                if algorithm_name == "mappo" else None,
+                "maddpg_critics": "two centralized critics over the full 15-dimensional state and joint action"
+                if algorithm_name == "maddpg" else None,
+                "maddpg_reward": "driving critic uses driving reward; energy critic uses energy reward"
+                if algorithm_name == "maddpg" else None,
+                "maddpg_rule_output_mode": maddpg_rule_mode if algorithm_name == "maddpg" else None,
+                "maddpg_rule_program": maddpg_rule_program if algorithm_name == "maddpg" else None,
+                "maddpg_rule_lambda": maddpg_rule_lambda if algorithm_name == "maddpg" else None,
+            }, f, indent=2)
+        top_reward_checkpoints = []
+        _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
+    else:
+        manifest_path = run_dir / "top_reward_checkpoints.json"
+        top_reward_checkpoints = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
 
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
     agent_config = dict(tr)
@@ -862,29 +948,28 @@ def main(argv=None):
     elif isinstance(agent, MADDPG):
         agent.rule_adapter = None
     if resumed_from_checkpoint:
-        if not isinstance(agent, (HASAC, MAPPO, MADDPG)):
-            raise TypeError("Checkpoint loading requires a HASAC, MAPPO, or MADDPG agent")
+        if not isinstance(agent, (TwoAgentSAC, HASAC, MAPPO, MADDPG)):
+            raise TypeError("Checkpoint loading requires a two-agent SAC, HASAC, MAPPO, or MADDPG agent")
         requested_prior_cfg = dict(cfg.get("llm_prior", {}))
         agent.load(resume_checkpoint, load_optimizers=True)
-        # The source checkpoint may have been trained without a prior. Restore
-        # this run's requested prior after loading the network/optimizer state.
-        agent.prior_cfg = requested_prior_cfg
-        agent.lambda_mean = float(requested_prior_cfg.get("lambda_0", 0.5))
-        agent.lambda_std = float(requested_prior_cfg.get("lambda_1", 0.5))
-        if isinstance(agent, MAPPO):
-            agent._validate_prior_lambdas()
-        elif isinstance(agent, HASAC):
-            if not 0.0 <= agent.lambda_mean <= 1.0:
-                raise ValueError("llm_prior.lambda_0 must be in [0, 1]")
-            if not 0.0 <= agent.lambda_std <= 1.0:
-                raise ValueError("llm_prior.lambda_1 must be in [0, 1]")
         if isinstance(agent, (HASAC, MAPPO)):
+            # The source checkpoint may have been trained without a prior.
+            # Restore this run's requested prior after loading its weights.
+            agent.prior_cfg = requested_prior_cfg
+            agent.lambda_mean = float(requested_prior_cfg.get("lambda_0", 0.5))
+            agent.lambda_std = float(requested_prior_cfg.get("lambda_1", 0.5))
             agent.prior_provider = agent._build_prior_provider()
             if requested_prior_cfg.get("enabled", False) and agent.prior_provider is None:
                 raise ValueError("Resume config enables prior but did not load its program")
-        # Preserve the new run's configured discount factor; on-policy data is
-        # always recollected after resume.
-        agent.gamma = float(tr["gamma"])
+            if isinstance(agent, MAPPO):
+                agent._validate_prior_lambdas()
+            else:
+                if not 0.0 <= agent.lambda_mean <= 1.0:
+                    raise ValueError("llm_prior.lambda_0 must be in [0, 1]")
+                if not 0.0 <= agent.lambda_std <= 1.0:
+                    raise ValueError("llm_prior.lambda_1 must be in [0, 1]")
+            # On-policy rollout data is always recollected after resume.
+            agent.gamma = float(tr["gamma"])
     if agent.device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(agent.device)
         device_label = f"{torch.cuda.get_device_name(agent.device)} (CUDA)"
@@ -924,11 +1009,41 @@ def main(argv=None):
         f"gamma={tr['gamma']}; seed={seed}",
         flush=True,
     )
-    global_step = 0
-    best_return = -float("inf")
+    if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None:
+        print(
+            f"Multi-rule prior: {agent.rule_runtime.program_name}; "
+            f"selection interval={agent.rule_runtime.selection_interval_steps} steps; "
+            f"rules={','.join(agent.rule_runtime.rules)}",
+            flush=True,
+        )
+        (run_dir / "rule_registry.json").write_text(
+            json.dumps(agent.rule_runtime.registry(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    if args.resume_run_dir is not None:
+        existing_rows = _read_episode_rows(run_dir / "episodes.csv")
+        prior_rows = [row for row in existing_rows if int(row["episode"]) <= args.resume_episode]
+        global_step = sum(int(row.get("steps", 0) or 0) for row in prior_rows)
+        best_return = max((float(row["return"]) for row in prior_rows), default=-float("inf"))
+        start_episode = args.resume_episode + 1
+        history_path = run_dir / "resume_history.json"
+        history = json.loads(history_path.read_text(encoding="utf-8")) if history_path.exists() else []
+        history.append({
+            "resumed_at": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint": str(resume_checkpoint),
+            "last_recorded_episode": args.resume_episode,
+            "checkpoint_episode": args.checkpoint_episode,
+            "target_episode": episodes,
+            "replay_buffer_restored": False,
+        })
+        history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    else:
+        global_step = 0
+        best_return = -float("inf")
+        start_episode = 1
     start_time = time.perf_counter()
     try:
-        for episode in range(1, episodes + 1):
+        for episode in range(start_episode, episodes + 1):
             prior_schedule_phase = _apply_prior_lambda_schedule(
                 agent, tr.get("prior_lambda_schedule"), episode
             )
@@ -942,6 +1057,8 @@ def main(argv=None):
             # Policy exploration and network updates remain stochastic, but
             # signals and the lead-vehicle stop plan use the same scene seed.
             obs, reset_info = env.reset(seed=seed)
+            if isinstance(agent, TwoAgentSAC):
+                agent.reset_rule_prior()
             state = normalize_observation(
                 obs, cfg["vehicle"], enabled=normalization_enabled
             )
@@ -967,6 +1084,9 @@ def main(argv=None):
             trace = []
             updates = []
             local_step = 0
+            rule_selection_counts = Counter()
+            rule_selection_lambdas = []
+            pending_rule_decision = None
             while True:
                 # Keep the exact raw state passed to the prior for the trace.
                 # The actor states are normalized/split views, while a rule
@@ -976,6 +1096,19 @@ def main(argv=None):
                 # actor/critic before env.step advances state to next_state.
                 policy_input_observation = np.asarray(state, dtype=np.float32).copy()
                 prior_output = None
+                if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None:
+                    if pending_rule_decision is not None:
+                        rule_decision = pending_rule_decision
+                        pending_rule_decision = None
+                    else:
+                        rule_decision = agent.rule_prior_for_step(obs, local_step)
+                else:
+                    rule_decision = None
+                if rule_decision is not None:
+                    prior_output = rule_decision.prior
+                    if rule_decision.selection_updated:
+                        rule_selection_counts[rule_decision.rule_name or "none"] += 1
+                        rule_selection_lambdas.append(rule_decision.lambda_value)
                 policy_record = None
                 maddpg_rule_output = None
                 maddpg_actor_action_unit = None
@@ -989,10 +1122,18 @@ def main(argv=None):
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
                         driving_action_unit = agent.driving.select_action(
-                            driving_state, deterministic=False
+                            driving_state, deterministic=False,
+                            prior=prior_output.driving if prior_output is not None else None,
+                            prior_lambda=(
+                                rule_decision.lambda_value if rule_decision is not None else 0.0
+                            ),
                         )
                         energy_action_unit = agent.energy.select_action(
-                            energy_state, deterministic=False
+                            energy_state, deterministic=False,
+                            prior=prior_output.energy if prior_output is not None else None,
+                            prior_lambda=(
+                                rule_decision.lambda_value if rule_decision is not None else 0.0
+                            ),
                         )
                     action_unit = np.asarray(
                         [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
@@ -1113,6 +1254,20 @@ def main(argv=None):
                             driving_reward, energy_reward,
                             next_driving_state, next_energy_state, done,
                             expected_team_reward=reward,
+                        )
+                    elif isinstance(agent, TwoAgentSAC):
+                        next_rule_decision = (
+                            agent.rule_prior_for_step(next_obs, local_step + 1)
+                            if agent.rule_runtime is not None and not done else None
+                        )
+                        pending_rule_decision = next_rule_decision
+                        agent.store_transition(
+                            driving_state, energy_state,
+                            driving_action_unit, energy_action_unit,
+                            driving_reward, energy_reward,
+                            next_driving_state, next_energy_state, done,
+                            current_rule_decision=rule_decision,
+                            next_rule_decision=next_rule_decision,
                         )
                     elif isinstance(agent, MAPPO):
                         if not np.isclose(driving_reward + energy_reward, reward, atol=1e-6):
@@ -1244,10 +1399,14 @@ def main(argv=None):
                         if prior_output is not None else None
                     ),
                     "policy_driving_prior_lambda_0": (
+                        rule_decision.lambda_value
+                        if isinstance(agent, TwoAgentSAC) and rule_decision is not None else
                         agent._agent_lambda_weights("driving")[0]
                         if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
                     ),
                     "policy_driving_prior_lambda_1": (
+                        rule_decision.lambda_value
+                        if isinstance(agent, TwoAgentSAC) and rule_decision is not None else
                         agent._agent_lambda_weights("driving")[1]
                         if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
                     ),
@@ -1264,12 +1423,28 @@ def main(argv=None):
                         if prior_output is not None else None
                     ),
                     "policy_energy_prior_lambda_0": (
+                        rule_decision.lambda_value
+                        if isinstance(agent, TwoAgentSAC) and rule_decision is not None else
                         agent._agent_lambda_weights("energy")[0]
                         if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
                     ),
                     "policy_energy_prior_lambda_1": (
+                        rule_decision.lambda_value
+                        if isinstance(agent, TwoAgentSAC) and rule_decision is not None else
                         agent._agent_lambda_weights("energy")[1]
                         if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
+                    ),
+                    "policy_selected_rule_name": (
+                        rule_decision.rule_name
+                        if rule_decision is not None else None
+                    ),
+                    "policy_rule_lambda": (
+                        rule_decision.lambda_value
+                        if rule_decision is not None else None
+                    ),
+                    "policy_rule_selection_updated": (
+                        int(rule_decision.selection_updated)
+                        if rule_decision is not None else None
                     ),
                     "policy_maddpg_rule_mode": (
                         agent.rule_output_mode if isinstance(agent, MADDPG) else None
@@ -1599,6 +1774,21 @@ def main(argv=None):
                     reset_info.get("lead_stop_plan", []), separators=(",", ":")
                 ),
             }
+            if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None:
+                row.update({
+                    "rule_prior_program": agent.rule_runtime.program_name,
+                    "rule_selection_interval_steps": (
+                        agent.rule_runtime.selection_interval_steps
+                    ),
+                    "rule_selection_counts_json": json.dumps(
+                        dict(rule_selection_counts), sort_keys=True
+                    ),
+                    "rule_selection_events": int(sum(rule_selection_counts.values())),
+                    "rule_selection_lambda_mean": (
+                        float(np.mean(rule_selection_lambdas))
+                        if rule_selection_lambdas else None
+                    ),
+                })
             row.update({f"reward_component_{name}": value for name, value in reward_component_totals.items()})
             row["reward_component_total"] = sum(reward_component_totals.values())
             _append_csv(run_dir / "episodes.csv", [row], list(row))
@@ -1783,6 +1973,18 @@ def main(argv=None):
         ),
         "maddpg_rule_lambda": (
             agent.rule_lambda if isinstance(agent, MADDPG) else None
+        ),
+        "sac_rule_prior_program": (
+            agent.rule_runtime.program_name
+            if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None else None
+        ),
+        "sac_rule_selection_interval_steps": (
+            agent.rule_runtime.selection_interval_steps
+            if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None else None
+        ),
+        "sac_rule_registry": (
+            agent.rule_runtime.registry()
+            if isinstance(agent, TwoAgentSAC) and agent.rule_runtime is not None else {}
         ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)

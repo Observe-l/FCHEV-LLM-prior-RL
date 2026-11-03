@@ -124,47 +124,61 @@ The extra penalty for negative acceleration at zero speed, the extra penalty for
 - The 300 m gap diagnostic threshold and 1000 m monitoring threshold are logging-only and do not terminate episodes. There is no long-stationary termination condition.
 - Collision, red-light, and speeding terminations currently have no extra negative terminal reward; their main effect is ending the episode.
 
-### 7. SAC Gaussian Rule Prior and Fusion
+### 7. Multi-Rule Selection and SAC Prior Fusion
 
-The rule program returns a distribution prior for each actor in the actor's latent space before `tanh`; it does not return physical acceleration, kW, or a sampled action. For actor `i` (driving or energy), let the SAC actor predict `μ_actor^i` and `σ_actor^i = exp(log_std_actor^i)`. The rule returns `μ_prior^i` and nonnegative `σ_prior^i`. The integration wrapper fuses mean and standard deviation independently:
+Generate one Python program containing a menu of separately named rules. A rule may address a task phase such as following, a traffic-light approach, a speed-limit transition, or energy management. The program also contains a selector that chooses which one rule to use and the prior weight `lambda` for that choice. This is ordinary Python decision logic in the generated program; it is not an online call to an LLM.
 
-`μ_f^i = (1−λ_μ^i) μ_actor^i + λ_μ^i μ_prior^i`
+The selector is evaluated once every `K` environment steps (default `K=5`, with one step equal to 1 s). At the start of each episode it is evaluated at step 0. Its selected rule name and `lambda` stay in effect until the next selection point. During those steps, the selected rule function is called on the latest raw observation at every 1 s step, so its prior values can respond to changing state even while its identity and weight remain fixed. The interval is configurable by the training command. Do not put a counter or hidden mutable state inside the generated program; the runtime controls the selection interval.
 
-`σ_f^i = (1−λ_σ^i) σ_actor^i + λ_σ^i σ_prior^i`
+For each actor `i` (driving or energy), the selected rule may return a latent Gaussian prior `(mu_prior^i, sigma_prior^i)` and an `active` flag. The SAC actor supplies `(mu_actor^i, sigma_actor^i)`, where `sigma_actor = exp(log_std_actor)`. The selector's single scalar `lambda` is shared by the selected rule's mean and standard-deviation fusion and by both agents; `active=False` independently bypasses fusion for that agent:
 
-The mean and standard-deviation weights are external configuration values, independent of each other and of the rule program. They may also be set separately for driving and energy. Use 0.5 for each weight only as an illustrative default; never hard-code the weights into the rule. `active=False` bypasses fusion for that actor on that observation. If `σ_prior=0` and `λ_σ<1`, the fused policy remains stochastic because the SAC actor still contributes standard deviation.
+`lambda_eff^i = lambda` when that agent's prior is active, otherwise `lambda_eff^i = 0`
 
-For stochastic SAC action selection, sample the fused distribution as `z = μ_f + σ_f ε`, where `ε ~ Normal(0,1)`, then compute `u=tanh(z)` and apply the physical mapping in Section 4. Deterministic action selection uses `u=tanh(μ_f)`. The rule changes the actor distribution but does not directly override the sampled or mapped action. Evaluate the rule from the current observation at each 1 s decision step.
+`mu_f^i = (1-lambda_eff^i) mu_actor^i + lambda_eff^i mu_prior^i`
+
+`sigma_f^i = (1-lambda_eff^i) sigma_actor^i + lambda_eff^i sigma_prior^i`
+
+`lambda` must be in `[0,1]`. If the selector chooses no rule, it returns `rule_name=None` (or `"none"`) and `lambda=0`. The rule's `std` is a standard deviation, not a variance or `log_std`; zero is allowed. The runtime applies a small positive numerical floor only when an active fusion would otherwise produce zero standard deviation.
+
+For stochastic action selection, SAC samples `z = mu_f + sigma_f * epsilon`, with `epsilon ~ Normal(0,1)`, then computes `u=tanh(z)` and applies the physical action mapping in Section 4. Deterministic evaluation uses `u=tanh(mu_f)`. The prior influences the action distribution; it does not directly issue the final action or override environment constraints.
+
+During training, replay records the actual fused action and the selected prior parameters and weight for both the current and next observation. SAC uses the matching next-state prior when computing the bootstrapped target and the matching current-state prior in its actor objective. This keeps replay learning consistent when the selected rule or `lambda` changes over time. With `lambda=0`, prior fusion has no effect and the action distribution follows ordinary SAC.
 
 ### 8. Rule Program Interface
 
-Design a Python module exposing `predict(observation)`. The program receives the full raw observation as a NumPy array shaped `(15,)` or `(batch,15)`, even though the SAC actors receive their separate normalized views. It must convert inputs to `float32`, validate shape and finite values, support single and batch inputs, and deterministically return both agent entries. Use one scalar per row; `(batch,1)` arrays are recommended:
+Return a single importable Python module. It must define:
+
+- `RULES`: a dictionary mapping every rule name to its rule function. Provide at least two distinct rule functions.
+- `select_rule(observation)`: the selector. It receives one complete raw observation as a `float32` NumPy array of shape `(15,)` and returns `{"rule_name": <key in RULES>, "lambda": <float in [0,1]>}`. It may return `{"rule_name": None, "lambda": 0.0}` to select no prior.
+
+Each function in `RULES` receives the complete raw, unnormalized observation as a `float32` NumPy array of shape `(batch,15)` and returns both agent entries, even if its prior is inactive for one or both agents. The runtime calls it with batch size 1. Use arrays of shape `(batch,1)`:
 
 ```python
 {
-    "driving": {"mean": driving_prior_mean, "std": driving_prior_std, "active": driving_active},
-    "energy":  {"mean": energy_prior_mean,  "std": energy_prior_std,  "active": energy_active},
+    "driving": {"mean": drive_mean, "std": drive_std, "active": drive_active},
+    "energy":  {"mean": energy_mean, "std": energy_std, "active": energy_active},
 }
 ```
 
-- Each actor has one action dimension. `mean` must be finite and expressed in pre-`tanh` latent Gaussian units. `std` must be finite and nonnegative; it is a standard deviation, not `log_std` or variance.
-- `active` is an optional Boolean or batch-shaped Boolean mask; if omitted it defaults to `True`. A conditional rule may set `active=False` when it has no justified prior for that actor/state. The program is still evaluated once each environment step.
-- The program may provide a prior for driving, energy, or both. It must not make either actor's decisions depend on an unobserved current action from the other actor.
-- Return the same distribution parameters deterministically for the same observation. Do not sample actions inside `predict` or add exploration noise.
-- NumPy is allowed. Do not use network services, API keys, online LLM calls, file I/O, environment globals, or SAC internals. The program returns prior parameters only; fusion, SAC sampling, and physical action mapping follow the definitions above.
-- Any new thresholds or coefficients must be clearly named rule hyperparameters with an explanation. Do not silently change the simulation environment, rewards, powertrain parameters, or hard constraints. Explicitly identify unavailable physical signals; do not fabricate them.
+- Each actor has one action dimension. Means are in the actor's latent space before `tanh`; standard deviations are finite and nonnegative. `active` is a Boolean or batch-shaped Boolean array. Set it false when that rule does not provide a prior for the actor at the current observation.
+- `select_rule` must be deterministic for a given observation. Rule functions must also return deterministic distribution parameters for the same observation. Do not sample actions or add exploration noise inside the program.
+- Validate observation shape and finite values. NumPy is allowed. Do not use network services, API keys, online LLM calls, file I/O, environment globals, or SAC internals.
+- Do not assume that a rule function is called only at selection boundaries: the selected function is evaluated every environment step on a fresh observation.
+- Do not make either agent's prior depend on an unobserved current action from the other agent. The two agents act from the same pre-action observation.
+- Give any added thresholds or coefficients clear names. Do not silently change the simulation, rewards, powertrain parameters, or environment constraints. Use only information available in the observation; do not assume access to unavailable physical signals.
 
-### 9. Minimal Interface Example: Recommend Braking Above the Current Limit
+### 9. Minimal Multi-Rule Interface Example
 
-This example demonstrates the prior interface and latent-mean definition; it is not a complete driving policy and does not handle following, traffic lights, or energy management. The target normalized action is `−0.999`, represented by prior mean `atanh(−0.999)≈−3.8002`. Its prior standard deviation is 0.05. When ego speed does not exceed the current limit, the driving prior is inactive. The energy prior is always inactive.
+This small example demonstrates two selectable rules and dynamic selection of both rule identity and `lambda`. It is only an interface example; it is not a complete vehicle policy and does not handle following, signals, or energy management comprehensively.
 
 ```python
 import numpy as np
 
 TARGET_U = -0.999
-TARGET_MEAN = float(np.arctanh(TARGET_U))
+BRAKE_MEAN = float(np.arctanh(TARGET_U))
+PRIOR_STD = 0.05
 
-def predict(observation):
+def _observation_batch(observation):
     x = np.asarray(observation, dtype=np.float32)
     if x.ndim == 1:
         x = x.reshape(1, -1)
@@ -172,28 +186,48 @@ def predict(observation):
         raise ValueError("observation must have shape (15,) or (batch, 15)")
     if not np.all(np.isfinite(x)):
         raise ValueError("observation must contain only finite values")
+    return x
 
+def select_rule(observation):
+    x = np.asarray(observation, dtype=np.float32)
+    if x.shape != (15,) or not np.all(np.isfinite(x)):
+        raise ValueError("selector observation must be a finite array with shape (15,)")
+    speed = float(x[5])
+    current_limit = float(x[12])
+    if current_limit > 0.0 and speed > current_limit:
+        return {"rule_name": "brake_above_limit", "lambda": 0.4}
+    return {"rule_name": "coast_within_limit", "lambda": 0.2}
+
+def _make_prior(observation, braking):
+    x = _observation_batch(observation)
     batch = x.shape[0]
-    speed = x[:, 5]
-    current_limit = x[:, 12]
-    active_drive = (current_limit > 0.0) & (speed > current_limit + 1e-6)
-    drive_mean = np.zeros((batch, 1), dtype=np.float32)
-    drive_mean[active_drive, 0] = TARGET_MEAN
-    drive_std = np.full((batch, 1), 0.05, dtype=np.float32)
+    drive_mean = np.full((batch, 1), BRAKE_MEAN if braking else 0.0, dtype=np.float32)
+    drive_std = np.full((batch, 1), PRIOR_STD, dtype=np.float32)
+    drive_active = np.ones((batch, 1), dtype=bool)
     zeros = np.zeros((batch, 1), dtype=np.float32)
     inactive = np.zeros((batch, 1), dtype=bool)
     return {
-        "driving": {
-            "mean": drive_mean,
-            "std": drive_std,
-            "active": active_drive.reshape(batch, 1),
-        },
+        "driving": {"mean": drive_mean, "std": drive_std, "active": drive_active},
         "energy": {"mean": zeros.copy(), "std": zeros.copy(), "active": inactive},
     }
+
+def rule_brake_above_limit(observation):
+    return _make_prior(observation, braking=True)
+
+def rule_coast_within_limit(observation):
+    return _make_prior(observation, braking=False)
+
+RULES = {
+    "brake_above_limit": rule_brake_above_limit,
+    "coast_within_limit": rule_coast_within_limit,
+}
 ```
 
-For example, if `observation[5]=18 m/s` and `observation[12]=16.6667 m/s`, the driving prior is active and proposes a latent mean near −3.8002; the energy prior is inactive. The final stochastic action still depends on the externally configured fusion weights and SAC actor distribution.
+The example's selector runs only at the configured interval. Within that interval, the selected function is still called each step with the current observation. The example's single `lambda` applies to both the mean and standard deviation for every active agent prior. The final stochastic action also depends on the SAC actor's distribution and Gaussian sampling.
 
 ### 10. Required Response
 
-Return (A) the complete Python module with a suggested filename and (B) a concise, precise explanation of its task logic, observations, prior triggers, `active` masks, mean/std values, and limits. Explain how the Gaussian prior would affect the SAC actor after external fusion and `tanh`, and distinguish the prior from the final executed action. Identify assumptions, unavailable signals, and any added rule hyperparameters. Do not provide a test suite, request code execution, or claim that the rule was executed or validated in SUMO.
+Provide these two items:
+
+1. An executable Python rule program containing `RULES` and `select_rule`, with the input and output interfaces defined in this section.
+2. A concise table listing each rule's name, a brief description, and its corresponding task stage, such as following, approaching a traffic signal, a speed-limit region, or energy management.
