@@ -987,24 +987,27 @@ def main(argv=None):
         algorithm_name, env.observation_space.shape[0],
         env.action_space.shape[0], agent_config, seed,
     )
-    online_current_lambda = None
+    online_current_lambdas = None
+    online_initial_lambdas = None
     online_current_source = online_initial_source
     online_current_provider = None
     if online_updater is not None:
         if not isinstance(agent, TwoAgentSAC) or agent.prior_provider is None:
             env.close()
             raise RuntimeError("online rule updates require a loaded two-agent SAC prior")
-        online_current_lambda = online_module.shared_lambda(agent)
+        online_current_lambdas = online_module.agent_lambdas(agent)
+        online_initial_lambdas = dict(online_current_lambdas)
         online_current_provider = agent.prior_provider
         agent.set_runtime_prior(
             agent.prior_provider,
             source=online_current_source,
             version=online_source_version,
-            lambda_value=online_current_lambda,
+            lambda_by_agent=online_current_lambdas,
         )
         online_run_meta_path = run_dir / "online_rule_updates" / "run.json"
         online_run_meta = json.loads(online_run_meta_path.read_text(encoding="utf-8"))
-        online_run_meta["initial_lambda"] = online_current_lambda
+        online_run_meta["initial_lambda"] = online_current_lambdas
+        online_run_meta["initial_lambdas"] = online_current_lambdas
         online_run_meta_path.write_text(
             json.dumps(online_run_meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -1831,13 +1834,13 @@ def main(argv=None):
                 agent, run_dir, episode, total_return, top_reward_checkpoints, limit=5
             )
             if online_updater is not None:
-                previous_lambda = float(online_current_lambda)
+                previous_lambdas = dict(online_current_lambdas)
                 previous_version = int(online_source_version)
                 context = online_module.build_episode_context(
                     _read_episode_rows(run_dir / "episodes.csv"),
                     row,
                     trace,
-                    previous_lambda,
+                    previous_lambdas,
                 )
                 proposal_result = None
                 update_error = None
@@ -1881,19 +1884,23 @@ def main(argv=None):
                                 f"{', '.join(proposal_result['candidate_normalization'])}",
                                 flush=True,
                             )
-                        proposed_lambda = decision.get("lambda")
-                        if (
-                            decision.get("change_lambda")
-                            and proposed_lambda is not None
-                            and abs(float(proposed_lambda) - previous_lambda) > 1e-12
-                        ):
-                            online_current_lambda = float(proposed_lambda)
-                            accepted_lambda = True
+                        proposed_lambdas = decision.get("lambda")
+                        if decision.get("change_lambda") and proposed_lambdas is not None:
+                            proposed_lambdas = {
+                                name: float(proposed_lambdas[name])
+                                for name in ("driving", "energy")
+                            }
+                            if any(
+                                abs(proposed_lambdas[name] - previous_lambdas[name]) > 1e-12
+                                for name in ("driving", "energy")
+                            ):
+                                online_current_lambdas = proposed_lambdas
+                                accepted_lambda = True
                         agent.set_runtime_prior(
                             online_current_provider,
                             source=online_current_source,
                             version=online_source_version,
-                            lambda_value=online_current_lambda,
+                            lambda_by_agent=online_current_lambdas,
                         )
                 except Exception as exc:
                     update_error = f"{type(exc).__name__}: {exc}"
@@ -1908,8 +1915,8 @@ def main(argv=None):
                         episode=episode,
                         context=context,
                         result=proposal_result,
-                        previous_lambda=previous_lambda,
-                        current_lambda=online_current_lambda,
+                        previous_lambdas=previous_lambdas,
+                        current_lambdas=online_current_lambdas,
                         previous_version=previous_version,
                         current_version=online_source_version,
                         current_source=online_current_source,
@@ -1919,8 +1926,11 @@ def main(argv=None):
                     )
                     print(
                         f"Episode {episode} LLM update: rule v{previous_version}->"
-                        f"v{online_source_version}, lambda {previous_lambda:.4g}->"
-                        f"{online_current_lambda:.4g}; record={record_path.name}",
+                        f"v{online_source_version}, lambda driving "
+                        f"{previous_lambdas['driving']:.4g}->"
+                        f"{online_current_lambdas['driving']:.4g}, energy "
+                        f"{previous_lambdas['energy']:.4g}->"
+                        f"{online_current_lambdas['energy']:.4g}; record={record_path.name}",
                         flush=True,
                     )
                 except Exception as exc:
@@ -2095,9 +2105,11 @@ def main(argv=None):
                 "update_frequency": "once after each completed episode; installed before the next episode",
                 "initial_program": "llm-prior/programs/fchev_rule_prior.py",
                 "initial_lambda": cfg["llm_prior"].get("lambda_0", 0.5),
+                "initial_lambdas": online_initial_lambdas,
                 "final_rule_version": online_source_version,
                 "final_rule_sha256": online_updater.source_sha256(online_current_source),
-                "final_lambda": online_current_lambda,
+                "final_lambda": online_current_lambdas,
+                "final_lambdas": online_current_lambdas,
                 "records_directory": str(run_dir / "online_rule_updates"),
             }
             if online_updater is not None else {"enabled": False}

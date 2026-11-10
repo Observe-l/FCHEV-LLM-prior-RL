@@ -140,13 +140,13 @@ For stochastic SAC action selection, sample the fused distribution as `z = μ_f 
 
 After each completed training episode, decide from the recorded training history and the completed episode whether the rule prior should change, whether the Gaussian-prior fusion weight should change, both, or neither. Base each decision on the supplied episode returns, reward components, completion or termination reason, vehicle/component metrics, and the final driving trajectory window. Consider whether observed behavior is a persistent issue or a one-episode event. Keep a parameter unchanged when the supplied evidence does not support changing it.
 
-**Keep RL optimization active.** The SAC actor must remain an active source of optimization; the rule is an auxiliary prior, not a replacement policy. For ordinary training, choose `lambda < 1` so the learned actor continues to contribute to the fused action distribution. Do not set or keep `lambda=1` for ongoing training: at `lambda=1`, the prior completely replaces the actor's mean and standard deviation wherever the prior is active. A value of 1 may be used only as a brief, one-episode diagnostic exception, and it must not be used in consecutive episodes. If the supplied `current_lambda` is `1.0`, you must set `change_lambda` to `true` and return a value strictly below 1 for the next episode. Avoid values so close to 1 that the actor's contribution is effectively negligible; use the observed rewards, successful completion, and termination patterns to keep a meaningful balance between rule guidance and learned policy improvement.
+**Keep RL optimization active for both agents.** The driving and energy SAC actors must each remain an active source of optimization; the rule is an auxiliary prior, not a replacement policy. Choose separate fusion weights `lambda.driving` and `lambda.energy` based on the evidence for each agent. For ordinary training, each value must be below 1 so that agent's learned actor continues to contribute to its fused action distribution. Do not set or keep either agent's lambda at 1 for ongoing training: at `lambda.agent=1`, the prior completely replaces that agent's mean and standard deviation wherever its prior is active. A value of 1 may be used only as a brief, one-episode diagnostic exception for that agent, and must not be used for that agent in consecutive episodes. If either supplied current lambda is `1.0`, set `change_lambda` to `true` and return a value strictly below 1 for that agent in the next episode. Avoid values so close to 1 that the corresponding actor's contribution is effectively negligible. Use each agent's reward and observed behavior to keep a meaningful balance between prior guidance and learned policy improvement.
 
 The rule is a soft prior to two independent SAC agents, not a replacement controller. If you change it, return the entire replacement Python module, preserving the current `predict(observation)` interface and the existing environment/action contracts in Sections 1–7. The original starting file is `fchev_rule_prior.py`; the training program supplies the current active source below. Do not assume hidden state, unobserved physical measurements, or environment modifications.
 
-The output has one scalar `lambda` in `[0, 1]`. If changed, that value is applied uniformly to the driving and energy agents' Gaussian mean and standard-deviation fusion weights (`lambda_0` and `lambda_1`). The update is installed only after the current episode finishes, so it first affects the next episode. The rule itself continues to run locally at every environment step; the LLM is called only at episode boundaries.
+The output has one scalar lambda per agent: `lambda.driving` and `lambda.energy`, each in `[0, 1]`. They may differ. Each agent's value is applied to both of that agent's Gaussian mean and standard-deviation fusion weights (`lambda_0` and `lambda_1`). If changing either value, return both fields; leave the other agent's value unchanged unless the evidence supports changing it too. The update is installed only after the current episode finishes, so it first affects the next episode. The rule itself continues to run locally at every environment step; the LLM is called only at episode boundaries.
 
-The RL-optimization requirement above applies to this output: `lambda=1` is not a normal ongoing-training setting. If `current_lambda` is `1.0`, the next value must be strictly less than 1.
+The RL-optimization requirement above applies independently to both outputs: neither agent should remain at `lambda=1` during ongoing training. If `current_lambda.driving` or `current_lambda.energy` is `1.0`, that agent's next value must be strictly less than 1.
 
 ### 9. Current Active Rule and Training Evidence
 
@@ -183,4 +183,15 @@ The request does not set a separate output-token cap. The response is still boun
 
 The `rule_program` value must be encoded as a normal JSON string: escape quotes and line breaks as required by JSON, but do not add a second layer of Python/string quoting. The decoded value itself—not a string literal that contains another quoted copy—must be executable Python source.
 
-Set `change_lambda` to `true` only when the supplied evidence justifies changing the fusion weight. In that case, `lambda` must be a finite JSON number in `[0, 1]`; otherwise set it to `null`. The scalar applies to both agents and to both mean/std fusion weights as described in Section 8.
+Set `change_lambda` to `true` only when the supplied evidence justifies changing at least one agent's fusion weight. In that case, `lambda` must be an object with exactly two finite JSON numbers in `[0, 1]`, keyed by `driving` and `energy`. Each value applies to both mean/std fusion weights for its corresponding agent, as described in Section 8. Return both values even if only one changes; copy the current value for the agent whose lambda should remain unchanged. When `change_lambda` is `false`, set `lambda` to `null`.
+
+For example, if only the energy agent's lambda should change, return both values and keep the driving value unchanged:
+
+```json
+{
+  "change_rule": false,
+  "rule_program": null,
+  "change_lambda": true,
+  "lambda": {"driving": 0.2, "energy": 0.35}
+}
+```

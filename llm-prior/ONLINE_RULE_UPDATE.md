@@ -79,7 +79,7 @@ The LLM receives the original rule prompt's environment/task/observation section
 
 Every completed call also saves the raw response as `episode_NNNN_response.txt`. Its JSON record stores `finish_reason`, token usage, prompt size, parse errors, and rule validation errors so output truncation can be distinguished from malformed JSON or an invalid Python program.
 
-The returned `lambda` is a single scalar in `[0,1]`. It updates both agents' `lambda_0` (mean) and `lambda_1` (standard-deviation) fusion weights. The update is installed after the current episode and affects the next episode.
+The returned `lambda` contains separate `driving` and `energy` scalars in `[0,1]`. They may differ. Each agent's scalar updates both that agent's `lambda_0` (mean) and `lambda_1` (standard-deviation) fusion weights. The update is installed after the current episode and affects the next episode. The command-line `--prior-lambda` still supplies the common initial value; subsequent LLM updates may set different values for the two agents.
 
 ## Run artifacts
 

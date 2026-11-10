@@ -70,35 +70,49 @@ class TwoAgentSAC:
         agent = self.agents[agent_name]
         return agent.lambda_mean, agent.lambda_std
 
-    def set_runtime_prior(self, provider, *, source, version, lambda_value=None):
-        """Install one episode-boundary rule version for both independent actors."""
+    def set_runtime_prior(self, provider, *, source, version, lambda_by_agent=None,
+                          lambda_value=None):
+        """Install a rule version and optional per-agent fusion weights."""
+        if lambda_value is not None:
+            if lambda_by_agent is not None:
+                raise ValueError("pass lambda_by_agent or legacy lambda_value, not both")
+            lambda_by_agent = {"driving": lambda_value, "energy": lambda_value}
+        if lambda_by_agent is not None and set(lambda_by_agent) != {"driving", "energy"}:
+            raise ValueError("lambda_by_agent must contain driving and energy")
+        normalized_lambdas = None
+        if lambda_by_agent is not None:
+            normalized_lambdas = {}
+            for name in ("driving", "energy"):
+                value = float(lambda_by_agent[name])
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(f"online rule lambda for {name} must be in [0, 1]")
+                normalized_lambdas[name] = value
         self.prior_provider = provider
         self.prior_program_source = source
         self.prior_program_version = int(version)
         self.prior_cfg["runtime_rule_program_version"] = int(version)
-        for subagent in (self.driving, self.energy):
+        shared_overrides = self.prior_cfg.setdefault("lambda_by_agent", {})
+        for name, subagent in self.agents.items():
             subagent.prior_provider = provider
             subagent.prior_cfg["runtime_rule_program_version"] = int(version)
-            if lambda_value is not None:
-                value = float(lambda_value)
-                if not 0.0 <= value <= 1.0:
-                    raise ValueError("online rule lambda must be in [0, 1]")
+            if normalized_lambdas is not None:
+                value = normalized_lambdas[name]
                 subagent.lambda_mean = value
                 subagent.lambda_std = value
                 subagent.prior_cfg["lambda_0"] = value
                 subagent.prior_cfg["lambda_1"] = value
-                subagent.prior_cfg["lambda_by_agent"] = {
-                    "driving": {"lambda_0": value, "lambda_1": value},
-                    "energy": {"lambda_0": value, "lambda_1": value},
+                shared_overrides[name] = {
+                    "lambda_0": value, "lambda_1": value,
                 }
-        if lambda_value is not None:
-            value = float(lambda_value)
-            self.prior_cfg["lambda_0"] = value
-            self.prior_cfg["lambda_1"] = value
-            self.prior_cfg["lambda_by_agent"] = {
-                "driving": {"lambda_0": value, "lambda_1": value},
-                "energy": {"lambda_0": value, "lambda_1": value},
-            }
+        for subagent in self.agents.values():
+            subagent.prior_cfg["lambda_by_agent"] = dict(shared_overrides)
+        if normalized_lambdas is not None:
+            for name, value in normalized_lambdas.items():
+                shared_overrides[name] = {"lambda_0": value, "lambda_1": value}
+            self.prior_cfg["lambda_0"] = normalized_lambdas["driving"]
+            self.prior_cfg["lambda_1"] = normalized_lambdas["driving"]
+            for subagent in self.agents.values():
+                subagent.prior_cfg["lambda_by_agent"] = dict(shared_overrides)
 
     @property
     def device(self):

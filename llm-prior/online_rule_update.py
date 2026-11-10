@@ -31,7 +31,15 @@ RULE_UPDATE_RESPONSE_SCHEMA = {
         "change_rule": {"type": "boolean"},
         "rule_program": {"type": ["string", "null"]},
         "change_lambda": {"type": "boolean"},
-        "lambda": {"type": ["number", "null"]},
+        "lambda": {
+            "type": ["object", "null"],
+            "properties": {
+                "driving": {"type": "number"},
+                "energy": {"type": "number"},
+            },
+            "required": ["driving", "energy"],
+            "additionalProperties": False,
+        },
     },
     "required": ["change_rule", "rule_program", "change_lambda", "lambda"],
     "additionalProperties": False,
@@ -205,8 +213,16 @@ def compile_rule_provider(source: str):
     contract = import_module("llm-prior.contract")
     try:
         contract.validate_prior_output(provider.predict(raw_obs), batch_size=1)
+        # SAC evaluates the rule over replay batches during gradient updates.
+        # A candidate that works for one observation can still broadcast a
+        # (batch,) vector against a (batch, 1) column into (batch, batch).
+        batch_obs = np.repeat(raw_obs.reshape(1, -1), 64, axis=0)
+        contract.validate_prior_output(provider.predict(batch_obs), batch_size=64)
     except Exception as exc:
-        raise RuleProgramError(f"predict(observation) violates the prior contract: {exc}") from exc
+        raise RuleProgramError(
+            "predict(observation) violates the single-row or batch prior contract: "
+            f"{exc}"
+        ) from exc
     return provider
 
 
@@ -257,11 +273,18 @@ def _final_trace_window(trace, window=20):
     return selected
 
 
-def build_episode_context(history_rows, current_row, trace, current_lambda):
+def build_episode_context(history_rows, current_row, trace, current_lambdas):
     """Compact complete episode history plus the current episode's final 20 steps."""
+    if not isinstance(current_lambdas, dict) or set(current_lambdas) != {"driving", "energy"}:
+        raise ValueError("current_lambdas must contain driving and energy values")
     return {
-        "current_lambda": float(current_lambda),
-        "lambda_scope": "one value shared by both agents' mean/std fusion weights",
+        "current_lambda": {
+            name: float(current_lambdas[name]) for name in ("driving", "energy")
+        },
+        "lambda_scope": (
+            "one independently adjustable value per agent; each agent's value is shared "
+            "by that agent's mean and std fusion weights"
+        ),
         "episode_history": _episode_history(history_rows),
         "current_episode": _current_episode(current_row),
         "final_20_steps_before_episode_end": _final_trace_window(trace, 20),
@@ -296,11 +319,15 @@ def _parse_llm_json(content):
         raise ValueError("rule_program must be null when change_rule=false")
     if value["change_lambda"]:
         lam = value["lambda"]
-        if isinstance(lam, bool) or not isinstance(lam, (int, float)):
-            raise ValueError("lambda must be a number when change_lambda=true")
-        if not math.isfinite(float(lam)) or not 0.0 <= float(lam) <= 1.0:
-            raise ValueError("lambda must be finite and lie in [0, 1]")
-        value["lambda"] = float(lam)
+        if not isinstance(lam, dict) or set(lam) != {"driving", "energy"}:
+            raise ValueError("lambda must contain exactly driving and energy numbers")
+        for name in ("driving", "energy"):
+            agent_lambda = lam[name]
+            if isinstance(agent_lambda, bool) or not isinstance(agent_lambda, (int, float)):
+                raise ValueError(f"lambda.{name} must be a number")
+            if not math.isfinite(float(agent_lambda)) or not 0.0 <= float(agent_lambda) <= 1.0:
+                raise ValueError(f"lambda.{name} must be finite and lie in [0, 1]")
+            lam[name] = float(agent_lambda)
     elif value["lambda"] is not None:
         raise ValueError("lambda must be null when change_lambda=false")
     return value
@@ -608,8 +635,8 @@ class StrataEpisodeRuleUpdater:
         }
 
     def write_episode_record(
-        self, *, run_dir, episode, context, result, previous_lambda,
-        current_lambda, previous_version, current_version, current_source,
+        self, *, run_dir, episode, context, result, previous_lambdas,
+        current_lambdas, previous_version, current_version, current_source,
         accepted_rule, accepted_lambda, error=None,
     ):
         updates_dir = Path(run_dir) / "online_rule_updates"
@@ -644,8 +671,12 @@ class StrataEpisodeRuleUpdater:
             ),
             "rule_updated": bool(accepted_rule),
             "lambda_updated": bool(accepted_lambda),
-            "lambda_before": float(previous_lambda),
-            "lambda_after": float(current_lambda),
+            "lambda_before": {
+                name: float(previous_lambdas[name]) for name in ("driving", "energy")
+            },
+            "lambda_after": {
+                name: float(current_lambdas[name]) for name in ("driving", "energy")
+            },
             "rule_version_before": int(previous_version),
             "rule_version_after": int(current_version),
             "rule_source_sha256": self.source_sha256(current_source),
@@ -659,16 +690,15 @@ class StrataEpisodeRuleUpdater:
         return record_path
 
 
-def shared_lambda(agent):
-    """Return the common lambda or reject a setup that cannot use scalar updates."""
-    values = [
-        float(agent._agent_lambda_weights(name)[index])
-        for name in ("driving", "energy") for index in (0, 1)
-    ]
-    if max(values) - min(values) > 1e-9:
-        raise ValueError(
-            "online rule updates currently require one shared lambda across both agents "
-            "and both Gaussian mean/std fusion weights"
-        )
-    return values[0]
+def agent_lambdas(agent):
+    """Return each agent's scalar lambda, requiring mean/std weights to match per agent."""
+    result = {}
+    for name in ("driving", "energy"):
+        lambda_mean, lambda_std = map(float, agent._agent_lambda_weights(name))
+        if abs(lambda_mean - lambda_std) > 1e-9:
+            raise ValueError(
+                f"online rule updates require {name} lambda_0 and lambda_1 to match"
+            )
+        result[name] = lambda_mean
+    return result
 
