@@ -54,6 +54,7 @@ TRACE_FIELDS = [
     "policy_input_distance_to_next_speed_region_div1000",
     "policy_driving_prior_mean", "policy_driving_prior_std", "policy_driving_prior_active",
     "policy_driving_prior_lambda_0", "policy_driving_prior_lambda_1",
+    "policy_prior_rule_version",
     "policy_energy_prior_mean", "policy_energy_prior_std", "policy_energy_prior_active",
     "policy_energy_prior_lambda_0", "policy_energy_prior_lambda_1",
     "policy_maddpg_rule_mode", "policy_maddpg_rule_lambda",
@@ -564,8 +565,18 @@ def evaluate(env, agent, cfg, episodes, base_seed, vehicle_cfg, max_steps=None):
                 driving_state, energy_state = split_agent_observations(
                     obs, vehicle_cfg, normalization_enabled
                 )
-                driving_action = agent.driving.select_action(driving_state, deterministic=True)
-                energy_action = agent.energy.select_action(energy_state, deterministic=True)
+                prior_output = (
+                    agent._predict_prior(obs)
+                    if agent.prior_provider is not None else None
+                )
+                driving_action = agent.driving.select_action(
+                    driving_state, deterministic=True, full_observation=obs,
+                    prior_output=prior_output,
+                )
+                energy_action = agent.energy.select_action(
+                    energy_state, deterministic=True, full_observation=obs,
+                    prior_output=prior_output,
+                )
                 physical_action = map_split_actions(
                     driving_action, energy_action, env.action_space
                 )
@@ -682,7 +693,15 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--prior-program-name", default=None,
-        help="Override llm_prior.program_name for HASAC priors or MADDPG rule programs",
+        help="Override llm_prior.program_name for Gaussian priors or MADDPG rule programs",
+    )
+    parser.add_argument(
+        "--enable-rule-prior", action="store_true",
+        help="Enable the configured Gaussian rule prior for SAC/HASAC/MAPPO",
+    )
+    parser.add_argument(
+        "--prior-lambda", type=float, default=None,
+        help="Set both prior mean and std fusion weights to this value",
     )
     parser.add_argument(
         "--maddpg-rule-output-mode",
@@ -702,6 +721,20 @@ def main(argv=None):
     parser.add_argument("--output-root", default="results")
     parser.add_argument("--experiment-name", default=None,
                         help="Optional label included in this run's unique output directory")
+    parser.add_argument(
+        "--enable-online-rule-updates", action="store_true",
+        help="After every episode, ask the configured local Strata model whether to update the SAC rule and shared prior lambda",
+    )
+    parser.add_argument("--llm-base-url", default=None,
+                        help="Strata OpenAI-compatible base URL (default: http://127.0.0.1:8080/v1)")
+    parser.add_argument("--llm-model", default=None,
+                        help="Model ID reported by Strata (default: auto-detect from /v1/models)")
+    parser.add_argument("--llm-api-key-env", default=None,
+                        help="Environment variable holding the Strata API key, if configured")
+    parser.add_argument("--llm-timeout-s", type=float, default=None,
+                        help="Timeout for each episode-boundary LLM call (default: 900 seconds)")
+    parser.add_argument("--llm-max-tokens", type=int, default=None,
+                        help="Optional Strata output-token cap; omit or use 0/-1 for no separate cap")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parent
@@ -712,7 +745,69 @@ def main(argv=None):
     normalization_enabled = bool(observation_cfg.get("normalization_enabled", True))
     if args.prior_program_name is not None:
         cfg.setdefault("llm_prior", {})["program_name"] = args.prior_program_name
+    if args.enable_rule_prior:
+        cfg.setdefault("llm_prior", {})["enabled"] = True
+    if args.prior_lambda is not None:
+        if not 0.0 <= args.prior_lambda <= 1.0:
+            raise ValueError("--prior-lambda must be in [0, 1]")
+        llm_prior_cfg = cfg.setdefault("llm_prior", {})
+        llm_prior_cfg["lambda_0"] = float(args.prior_lambda)
+        llm_prior_cfg["lambda_1"] = float(args.prior_lambda)
     algorithm_name = (args.algorithm or cfg["training"]["algorithm"]).lower()
+    configured_online_update = cfg.get("llm_prior", {}).get("online_update", {})
+    if not isinstance(configured_online_update, dict):
+        configured_online_update = {}
+    online_rule_updates_enabled = bool(
+        args.enable_online_rule_updates
+        or (isinstance(configured_online_update, dict) and configured_online_update.get("enabled", False))
+    )
+    if online_rule_updates_enabled:
+        if algorithm_name != "sac":
+            raise ValueError("online LLM rule updates currently require --algorithm sac")
+        llm_prior_cfg = cfg.setdefault("llm_prior", {})
+        requested_program = llm_prior_cfg.get("program_name", "fchev_rule_prior")
+        if requested_program != "fchev_rule_prior":
+            raise ValueError(
+                "online LLM rule updates must start from llm-prior/programs/fchev_rule_prior.py"
+            )
+        llm_prior_cfg["program_name"] = "fchev_rule_prior"
+        llm_prior_cfg["enabled"] = True
+        requested_max_tokens = (
+            args.llm_max_tokens
+            if args.llm_max_tokens is not None
+            else configured_online_update.get("max_tokens")
+        )
+        output_max_tokens = (
+            None
+            if requested_max_tokens is None or int(requested_max_tokens) in (0, -1)
+            else int(requested_max_tokens)
+        )
+        online_update_settings = {
+            "enabled": True,
+            "base_url": args.llm_base_url or configured_online_update.get(
+                "base_url", "http://127.0.0.1:8080/v1"
+            ),
+            "model": args.llm_model or configured_online_update.get("model", "auto"),
+            "api_key_env": args.llm_api_key_env or configured_online_update.get(
+                "api_key_env", "STRATA_API_KEY"
+            ),
+            "timeout_s": float(
+                args.llm_timeout_s
+                if args.llm_timeout_s is not None
+                else configured_online_update.get("timeout_s", 900.0)
+            ),
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "reasoning_effort": "low",
+            "enable_thinking": True,
+            "max_tokens": output_max_tokens,
+        }
+        if online_update_settings["timeout_s"] <= 0:
+            raise ValueError("--llm-timeout-s must be positive")
+        if online_update_settings["max_tokens"] is not None and online_update_settings["max_tokens"] <= 0:
+            raise ValueError("--llm-max-tokens must be positive, 0, or -1")
+        llm_prior_cfg["online_update"] = online_update_settings
     resume_checkpoint = None
     if args.resume_checkpoint is not None:
         resume_checkpoint = Path(args.resume_checkpoint)
@@ -838,9 +933,50 @@ def main(argv=None):
             "maddpg_rule_output_mode": maddpg_rule_mode if algorithm_name == "maddpg" else None,
             "maddpg_rule_program": maddpg_rule_program if algorithm_name == "maddpg" else None,
             "maddpg_rule_lambda": maddpg_rule_lambda if algorithm_name == "maddpg" else None,
+            "llm_prior": dict(cfg.get("llm_prior", {})),
         }, f, indent=2)
     top_reward_checkpoints = []
     _write_top_checkpoint_manifest(run_dir / "top_reward_checkpoints.json", top_reward_checkpoints)
+
+    online_updater = None
+    online_initial_source = None
+    online_source_version = 0
+    online_module = None
+    if online_rule_updates_enabled:
+        online_module = import_module("llm-prior.online_rule_update")
+        online_settings = cfg["llm_prior"]["online_update"]
+        online_updater = online_module.StrataEpisodeRuleUpdater(
+            base_url=online_settings["base_url"],
+            model=online_settings["model"],
+            api_key_env=online_settings["api_key_env"],
+            timeout_s=online_settings["timeout_s"],
+            max_tokens=online_settings["max_tokens"],
+            temperature=online_settings["temperature"],
+            top_p=online_settings["top_p"],
+            top_k=online_settings["top_k"],
+            reasoning_effort=online_settings["reasoning_effort"],
+            enable_thinking=online_settings["enable_thinking"],
+        )
+        # Check connectivity before SUMO starts, so a missing local model cannot
+        # leave an environment process running without an LLM update path.
+        online_models = online_updater.check_server()
+        online_initial_source = (
+            root / "llm-prior" / "programs" / "fchev_rule_prior.py"
+        ).read_text(encoding="utf-8")
+        artifact_info = online_updater.save_initial_artifacts(run_dir, online_initial_source)
+        artifact_info.update({
+            "base_url": online_settings["base_url"],
+            "model": online_updater.model,
+            "model_list_response": online_models,
+            "sampling": online_updater.parameters,
+            "conversation_mode": "stateless single-turn; one fresh user message per episode",
+            "api_key_env": online_settings["api_key_env"],
+            "initial_program": "llm-prior/programs/fchev_rule_prior.py",
+            "initial_lambda": cfg["llm_prior"].get("lambda_0", 0.5),
+        })
+        (run_dir / "online_rule_updates" / "run.json").write_text(
+            json.dumps(artifact_info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     env = FCHEVEnv(project_root=root, config=cfg, render_mode="human" if args.gui else None)
     agent_config = dict(tr)
@@ -851,6 +987,27 @@ def main(argv=None):
         algorithm_name, env.observation_space.shape[0],
         env.action_space.shape[0], agent_config, seed,
     )
+    online_current_lambda = None
+    online_current_source = online_initial_source
+    online_current_provider = None
+    if online_updater is not None:
+        if not isinstance(agent, TwoAgentSAC) or agent.prior_provider is None:
+            env.close()
+            raise RuntimeError("online rule updates require a loaded two-agent SAC prior")
+        online_current_lambda = online_module.shared_lambda(agent)
+        online_current_provider = agent.prior_provider
+        agent.set_runtime_prior(
+            agent.prior_provider,
+            source=online_current_source,
+            version=online_source_version,
+            lambda_value=online_current_lambda,
+        )
+        online_run_meta_path = run_dir / "online_rule_updates" / "run.json"
+        online_run_meta = json.loads(online_run_meta_path.read_text(encoding="utf-8"))
+        online_run_meta["initial_lambda"] = online_current_lambda
+        online_run_meta_path.write_text(
+            json.dumps(online_run_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     if isinstance(agent, MADDPG) and maddpg_rule_mode != "none":
         agent.rule_adapter = MADDPGRuleAdapter(
             maddpg_rule_program,
@@ -896,7 +1053,10 @@ def main(argv=None):
     elif isinstance(agent, TwoAgentSAC):
         replay_agents = agent.agents
         replay_mb = sum(
-            subagent.replay.data.numel() * subagent.replay.data.element_size()
+            (subagent.replay.data.numel() + (
+                subagent.replay.auxiliary_data.numel()
+                if subagent.replay.auxiliary_data is not None else 0
+            )) * subagent.replay.data.element_size()
             for subagent in replay_agents.values()
         ) / (1024 ** 2)
         replay_device_label = ", ".join(
@@ -924,6 +1084,13 @@ def main(argv=None):
         f"gamma={tr['gamma']}; seed={seed}",
         flush=True,
     )
+    if isinstance(agent, TwoAgentSAC) and agent.prior_provider is not None:
+        print(
+            f"SAC Gaussian prior: program={cfg['llm_prior'].get('program_name')}; "
+            f"driving lambda={agent._agent_lambda_weights('driving')}; "
+            f"energy lambda={agent._agent_lambda_weights('energy')}",
+            flush=True,
+        )
     global_step = 0
     best_return = -float("inf")
     start_time = time.perf_counter()
@@ -933,6 +1100,9 @@ def main(argv=None):
                 agent, tr.get("prior_lambda_schedule"), episode
             )
             if isinstance(agent, (HASAC, MAPPO)):
+                driving_lambda_0, driving_lambda_1 = agent._agent_lambda_weights("driving")
+                energy_lambda_0, energy_lambda_1 = agent._agent_lambda_weights("energy")
+            elif isinstance(agent, TwoAgentSAC) and agent.prior_provider is not None:
                 driving_lambda_0, driving_lambda_1 = agent._agent_lambda_weights("driving")
                 energy_lambda_0, energy_lambda_1 = agent._agent_lambda_weights("energy")
             else:
@@ -984,15 +1154,19 @@ def main(argv=None):
                     float(energy_state[0]) if is_dual_policy_agent(agent) else None
                 )
                 if isinstance(agent, TwoAgentSAC):
+                    if agent.prior_provider is not None:
+                        prior_output = agent._predict_prior(obs)
                     if global_step < learning_starts and not resumed_from_checkpoint:
                         driving_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                         energy_action_unit = np.random.uniform(-1.0, 1.0, size=1).astype(np.float32)
                     else:
                         driving_action_unit = agent.driving.select_action(
-                            driving_state, deterministic=False
+                            driving_state, deterministic=False,
+                            full_observation=obs, prior_output=prior_output,
                         )
                         energy_action_unit = agent.energy.select_action(
-                            energy_state, deterministic=False
+                            energy_state, deterministic=False,
+                            full_observation=obs, prior_output=prior_output,
                         )
                     action_unit = np.asarray(
                         [driving_action_unit[0], energy_action_unit[0]], dtype=np.float32
@@ -1151,13 +1325,17 @@ def main(argv=None):
                             next_rule_values, next_rule_active,
                         )
                     else:
+                        auxiliary = ({
+                            "auxiliary_state": obs,
+                            "next_auxiliary_state": next_obs,
+                        } if agent.prior_provider is not None else {})
                         agent.driving.replay.add(
                             driving_state, driving_action_unit,
-                            driving_reward, next_driving_state, done,
+                            driving_reward, next_driving_state, done, **auxiliary,
                         )
                         agent.energy.replay.add(
                             energy_state, energy_action_unit,
-                            energy_reward, next_energy_state, done,
+                            energy_reward, next_energy_state, done, **auxiliary,
                         )
                     driving_state, energy_state = next_driving_state, next_energy_state
                     total_driving_return += driving_reward
@@ -1196,6 +1374,9 @@ def main(argv=None):
                     )
                 trace.append({
                     "time_s": info.get("sumo_time_s"), "reward": reward,
+                    "policy_prior_rule_version": (
+                        online_source_version if online_updater is not None else None
+                    ),
                     "driving_agent_reward": driving_reward if is_dual_policy_agent(agent) else None,
                     "energy_agent_reward": energy_reward if is_dual_policy_agent(agent) else None,
                     **{
@@ -1245,11 +1426,11 @@ def main(argv=None):
                     ),
                     "policy_driving_prior_lambda_0": (
                         agent._agent_lambda_weights("driving")[0]
-                        if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
+                        if isinstance(agent, (HASAC, MAPPO, TwoAgentSAC)) and prior_output is not None else None
                     ),
                     "policy_driving_prior_lambda_1": (
                         agent._agent_lambda_weights("driving")[1]
-                        if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
+                        if isinstance(agent, (HASAC, MAPPO, TwoAgentSAC)) and prior_output is not None else None
                     ),
                     "policy_energy_prior_mean": (
                         float(prior_output.energy.mean[0, 0])
@@ -1265,11 +1446,11 @@ def main(argv=None):
                     ),
                     "policy_energy_prior_lambda_0": (
                         agent._agent_lambda_weights("energy")[0]
-                        if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
+                        if isinstance(agent, (HASAC, MAPPO, TwoAgentSAC)) and prior_output is not None else None
                     ),
                     "policy_energy_prior_lambda_1": (
                         agent._agent_lambda_weights("energy")[1]
-                        if isinstance(agent, (HASAC, MAPPO)) and prior_output is not None else None
+                        if isinstance(agent, (HASAC, MAPPO, TwoAgentSAC)) and prior_output is not None else None
                     ),
                     "policy_maddpg_rule_mode": (
                         agent.rule_output_mode if isinstance(agent, MADDPG) else None
@@ -1530,7 +1711,7 @@ def main(argv=None):
                             losses = subagent.update(batch_size)
                             losses["agent"] = subagent_name
                             losses["global_step"] = global_step
-                            if isinstance(agent, HASAC):
+                            if isinstance(agent, (HASAC, TwoAgentSAC)) and agent.prior_provider is not None:
                                 for name in ("driving", "energy"):
                                     lambda_0, lambda_1 = agent._agent_lambda_weights(name)
                                     losses[f"{name}_prior_lambda_0"] = lambda_0
@@ -1601,6 +1782,11 @@ def main(argv=None):
             }
             row.update({f"reward_component_{name}": value for name, value in reward_component_totals.items()})
             row["reward_component_total"] = sum(reward_component_totals.values())
+            if online_updater is not None:
+                row["active_rule_version"] = online_source_version
+                row["active_rule_sha256"] = online_updater.source_sha256(
+                    online_current_source
+                )
             _append_csv(run_dir / "episodes.csv", [row], list(row))
             loss_fields = [
                 "agent", "global_step", "critic_loss", "actor_loss",
@@ -1644,6 +1830,104 @@ def main(argv=None):
             top_reward_checkpoints = _consider_top_reward_checkpoint(
                 agent, run_dir, episode, total_return, top_reward_checkpoints, limit=5
             )
+            if online_updater is not None:
+                previous_lambda = float(online_current_lambda)
+                previous_version = int(online_source_version)
+                context = online_module.build_episode_context(
+                    _read_episode_rows(run_dir / "episodes.csv"),
+                    row,
+                    trace,
+                    previous_lambda,
+                )
+                proposal_result = None
+                update_error = None
+                accepted_rule = False
+                accepted_lambda = False
+                try:
+                    proposal_result = online_updater.request_update(
+                        current_rule_source=online_current_source,
+                        context=context,
+                    )
+                    if proposal_result.get("response_error"):
+                        update_error = proposal_result["response_error"]
+                        print(
+                            f"LLM update response rejected after episode {episode}: "
+                            f"{update_error}",
+                            flush=True,
+                        )
+                    else:
+                        decision = proposal_result["decision"]
+                        proposed_source = proposal_result["candidate_source"]
+                        proposed_provider = proposal_result["candidate_provider"]
+                        if (
+                            decision["change_rule"]
+                            and proposed_provider is not None
+                            and online_updater.source_sha256(proposed_source)
+                            != online_updater.source_sha256(online_current_source)
+                        ):
+                            online_current_source = proposed_source
+                            online_current_provider = proposed_provider
+                            online_source_version += 1
+                            accepted_rule = True
+                        if proposal_result.get("candidate_error"):
+                            print(
+                                f"Rejected LLM rule after episode {episode}: "
+                                f"{proposal_result['candidate_error']}",
+                                flush=True,
+                            )
+                        elif proposal_result.get("candidate_normalization"):
+                            print(
+                                f"Normalized LLM rule wrapper after episode {episode}: "
+                                f"{', '.join(proposal_result['candidate_normalization'])}",
+                                flush=True,
+                            )
+                        proposed_lambda = decision.get("lambda")
+                        if (
+                            decision.get("change_lambda")
+                            and proposed_lambda is not None
+                            and abs(float(proposed_lambda) - previous_lambda) > 1e-12
+                        ):
+                            online_current_lambda = float(proposed_lambda)
+                            accepted_lambda = True
+                        agent.set_runtime_prior(
+                            online_current_provider,
+                            source=online_current_source,
+                            version=online_source_version,
+                            lambda_value=online_current_lambda,
+                        )
+                except Exception as exc:
+                    update_error = f"{type(exc).__name__}: {exc}"
+                    print(
+                        f"LLM update failed after episode {episode}; retaining the "
+                        f"current rule and lambda: {update_error}",
+                        flush=True,
+                    )
+                try:
+                    record_path = online_updater.write_episode_record(
+                        run_dir=run_dir,
+                        episode=episode,
+                        context=context,
+                        result=proposal_result,
+                        previous_lambda=previous_lambda,
+                        current_lambda=online_current_lambda,
+                        previous_version=previous_version,
+                        current_version=online_source_version,
+                        current_source=online_current_source,
+                        accepted_rule=accepted_rule,
+                        accepted_lambda=accepted_lambda,
+                        error=update_error,
+                    )
+                    print(
+                        f"Episode {episode} LLM update: rule v{previous_version}->"
+                        f"v{online_source_version}, lambda {previous_lambda:.4g}->"
+                        f"{online_current_lambda:.4g}; record={record_path.name}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        f"Could not save LLM update record after episode {episode}: {exc}",
+                        flush=True,
+                    )
             if episode % int(tr.get("save_interval_episodes", 10)) == 0 or episode == episodes:
                 _atomic_save_agent(agent, run_dir / "final.pt")
                 if episode == episodes:
@@ -1783,6 +2067,40 @@ def main(argv=None):
         ),
         "maddpg_rule_lambda": (
             agent.rule_lambda if isinstance(agent, MADDPG) else None
+        ),
+        "sac_rule_prior": (
+            {
+                "enabled": True,
+                "program_name": cfg["llm_prior"].get("program_name"),
+                "lambda_by_agent": {
+                    name: {
+                        "lambda_0": agent._agent_lambda_weights(name)[0],
+                        "lambda_1": agent._agent_lambda_weights(name)[1],
+                    }
+                    for name in ("driving", "energy")
+                },
+                "fusion_space": "pre-tanh Gaussian mean and standard deviation",
+                "replay_prior_observation": "stored raw 15D current/next observations",
+            }
+            if isinstance(agent, TwoAgentSAC) and agent.prior_provider is not None
+            else None
+        ),
+        "online_rule_updates": (
+            {
+                "enabled": True,
+                "provider": "Strata OpenAI-compatible Chat Completions",
+                "base_url": cfg["llm_prior"]["online_update"]["base_url"],
+                "model": online_updater.model,
+                "sampling": online_updater.parameters,
+                "update_frequency": "once after each completed episode; installed before the next episode",
+                "initial_program": "llm-prior/programs/fchev_rule_prior.py",
+                "initial_lambda": cfg["llm_prior"].get("lambda_0", 0.5),
+                "final_rule_version": online_source_version,
+                "final_rule_sha256": online_updater.source_sha256(online_current_source),
+                "final_lambda": online_current_lambda,
+                "records_directory": str(run_dir / "online_rule_updates"),
+            }
+            if online_updater is not None else {"enabled": False}
         ),
         "gpu_peak_memory_mb": (
             torch.cuda.max_memory_allocated(agent.device) / (1024 ** 2)
