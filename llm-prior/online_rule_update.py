@@ -1,8 +1,9 @@
 """Episode-boundary LLM rule updates over Strata's OpenAI-compatible API.
 
 This module is opt-in. It does not make per-step LLM calls: the current Python
-rule still evaluates locally at each step, and the LLM is contacted only after
-an episode has completed.
+rule evaluates locally at each step, and the LLM is contacted only after an
+episode has completed. It supports both SAC rule-prior updates and rule-only
+controller updates.
 """
 
 from __future__ import annotations
@@ -42,6 +43,16 @@ RULE_UPDATE_RESPONSE_SCHEMA = {
         },
     },
     "required": ["change_rule", "rule_program", "change_lambda", "lambda"],
+    "additionalProperties": False,
+}
+
+RULE_ONLY_UPDATE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "change_rule": {"type": "boolean"},
+        "rule_program": {"type": ["string", "null"]},
+    },
+    "required": ["change_rule", "rule_program"],
     "additionalProperties": False,
 }
 
@@ -291,6 +302,15 @@ def build_episode_context(history_rows, current_row, trace, current_lambdas):
     }
 
 
+def build_rule_only_episode_context(history_rows, current_row, trace):
+    """Episode history and a compact trace for rule-only online updates."""
+    return {
+        "episode_history": _episode_history(history_rows),
+        "current_episode": _current_episode(current_row),
+        "final_20_steps_before_episode_end": _final_trace_window(trace, 20),
+    }
+
+
 def _parse_llm_json(content):
     if not isinstance(content, str):
         raise ValueError("chat completion content is not text")
@@ -333,6 +353,30 @@ def _parse_llm_json(content):
     return value
 
 
+def _parse_rule_only_llm_json(content):
+    if not isinstance(content, str):
+        raise ValueError("chat completion content is not text")
+    text = content.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("LLM response does not contain a JSON object")
+    value, end = json.JSONDecoder().raw_decode(text[start:])
+    if text[start + end:].strip():
+        raise ValueError("LLM response must contain only one JSON object")
+    if not isinstance(value, dict) or set(value) != {"change_rule", "rule_program"}:
+        raise ValueError("rule-only response must contain exactly change_rule and rule_program")
+    if not isinstance(value["change_rule"], bool):
+        raise ValueError("change_rule must be a JSON boolean")
+    if value["change_rule"]:
+        if not isinstance(value["rule_program"], str) or not value["rule_program"].strip():
+            raise ValueError("rule_program must contain the full Python source when change_rule=true")
+    elif value["rule_program"] is not None:
+        raise ValueError("rule_program must be null when change_rule=false")
+    return value
+
+
 def _normalize_rule_source(source):
     """Remove common transport wrappers without evaluating generated code."""
     candidate = source.strip()
@@ -359,7 +403,7 @@ class StrataEpisodeRuleUpdater:
         self, *, base_url="http://127.0.0.1:8080/v1", model="auto",
         api_key_env="STRATA_API_KEY", timeout_s=900.0, max_tokens=None,
         temperature=1.0, top_p=0.95, top_k=20,
-        reasoning_effort="low", enable_thinking=True,
+        reasoning_effort="low", enable_thinking=True, mode="sac",
     ):
         self.base_url = base_url.rstrip("/")
         if not self.base_url.endswith("/v1"):
@@ -376,7 +420,15 @@ class StrataEpisodeRuleUpdater:
         self.top_k = int(top_k)
         self.reasoning_effort = str(reasoning_effort)
         self.enable_thinking = bool(enable_thinking)
-        self.template_path = Path(__file__).parent / "prompts" / "fchev_llm_rule_prior_episode_update_en.md"
+        if mode not in ("sac", "rule_only"):
+            raise ValueError("online rule update mode must be 'sac' or 'rule_only'")
+        self.mode = mode
+        template_name = (
+            "fchev_llm_rule_only_episode_update_en.md"
+            if mode == "rule_only"
+            else "fchev_llm_rule_prior_episode_update_en.md"
+        )
+        self.template_path = Path(__file__).parent / "prompts" / template_name
         self.template = self.template_path.read_text(encoding="utf-8")
 
     @property
@@ -390,9 +442,17 @@ class StrataEpisodeRuleUpdater:
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "fchev_rule_update",
+                    "name": (
+                        "fchev_rule_only_update"
+                        if self.mode == "rule_only"
+                        else "fchev_rule_update"
+                    ),
                     "strict": True,
-                    "schema": RULE_UPDATE_RESPONSE_SCHEMA,
+                    "schema": (
+                        RULE_ONLY_UPDATE_RESPONSE_SCHEMA
+                        if self.mode == "rule_only"
+                        else RULE_UPDATE_RESPONSE_SCHEMA
+                    ),
                 },
             },
         }
@@ -579,7 +639,11 @@ class StrataEpisodeRuleUpdater:
                 "candidate_error": None,
             }
         try:
-            decision = _parse_llm_json(response_text)
+            decision = (
+                _parse_rule_only_llm_json(response_text)
+                if self.mode == "rule_only"
+                else _parse_llm_json(response_text)
+            )
         except Exception as exc:
             return {
                 "decision": None,
@@ -635,9 +699,9 @@ class StrataEpisodeRuleUpdater:
         }
 
     def write_episode_record(
-        self, *, run_dir, episode, context, result, previous_lambdas,
-        current_lambdas, previous_version, current_version, current_source,
-        accepted_rule, accepted_lambda, error=None,
+        self, *, run_dir, episode, context, result, previous_version,
+        current_version, current_source, accepted_rule, accepted_lambda=False,
+        previous_lambdas=None, current_lambdas=None, error=None,
     ):
         updates_dir = Path(run_dir) / "online_rule_updates"
         updates_dir.mkdir(parents=True, exist_ok=True)
@@ -651,6 +715,7 @@ class StrataEpisodeRuleUpdater:
                 response_path.write_text(result["response_text"], encoding="utf-8")
         record = {
             "episode": int(episode),
+            "controller_mode": self.mode,
             "conversation_mode": "stateless single-turn; no previous LLM messages are sent",
             "context": context,
             "request_parameters": self.parameters,
@@ -670,18 +735,23 @@ class StrataEpisodeRuleUpdater:
                 result.get("candidate_normalization") if result else None
             ),
             "rule_updated": bool(accepted_rule),
-            "lambda_updated": bool(accepted_lambda),
-            "lambda_before": {
-                name: float(previous_lambdas[name]) for name in ("driving", "energy")
-            },
-            "lambda_after": {
-                name: float(current_lambdas[name]) for name in ("driving", "energy")
-            },
             "rule_version_before": int(previous_version),
             "rule_version_after": int(current_version),
             "rule_source_sha256": self.source_sha256(current_source),
             "rule_source_path": str(rule_path),
         }
+        if self.mode == "sac":
+            if previous_lambdas is None or current_lambdas is None:
+                raise ValueError("SAC update records require before/after lambdas")
+            record.update({
+                "lambda_updated": bool(accepted_lambda),
+                "lambda_before": {
+                    name: float(previous_lambdas[name]) for name in ("driving", "energy")
+                },
+                "lambda_after": {
+                    name: float(current_lambdas[name]) for name in ("driving", "energy")
+                },
+            })
         record_path = updates_dir / f"episode_{episode:04d}.json"
         record_path.write_text(
             json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False),
